@@ -1,5 +1,10 @@
 package config
 
+import (
+	"fmt"
+	"net/url"
+)
+
 type DatabaseDriver string
 type CacheProvider string
 type TelemetryProvider string
@@ -7,6 +12,7 @@ type TelemetryProvider string
 const (
 	DatabaseDriverPostgres DatabaseDriver = "postgres"
 	DatabaseDriverSqlite3  DatabaseDriver = "sqlite3"
+	DatabaseDriverMySQL    DatabaseDriver = "mysql"
 
 	DefaultConfigFilePath string = ".env"
 
@@ -19,10 +25,24 @@ const (
 )
 
 type Config struct {
-	EncryptionKey string `json:"encryption_key" envconfig:"ENCRYPTION_KEY"`
-	Server        Server `json:"server"`
-	Cors          Cors   `json:"cors"`
-	Cache         Cache  `json:"cache"`
+	EncryptionKey string   `json:"encryption_key" envconfig:"ENCRYPTION_KEY"`
+	Server        Server   `json:"server"`
+	Cors          Cors     `json:"cors"`
+	Cache         Cache    `json:"cache"`
+	Database      Database `json:"database"`
+}
+
+// Database defines database configuration
+type Database struct {
+	Driver   DatabaseDriver `json:"driver" envconfig:"DB_DRIVER"`
+	Host     string         `json:"host" envconfig:"DB_HOST"`
+	Port     int            `json:"port" envconfig:"DB_PORT"`
+	User     string         `json:"user" envconfig:"DB_USER"`
+	Path     string         `json:"path" envconfig:"DB_PATH"`
+	Schema   string         `json:"schema" envconfig:"DB_SCHEMA"`
+	Password string         `json:"password" envconfig:"DB_PASSWORD"`
+	Database string         `json:"database" envconfig:"DB_DATABASE"`
+	Options  string         `json:"options" envconfig:"DB_OPTIONS"`
 }
 
 type Cache struct {
@@ -57,4 +77,42 @@ type Redis struct {
 	MaxRetries         int    `json:"max_retries" envconfig:"REDIS_MAX_RETRIES"`
 	MinIdleConnections int    `json:"min_idle_connections" envconfig:"REDIS_MIN_IDLE_CONNECTIONS"`
 	DB                 int    `json:"db" envconfig:"REDIS_DB"`
+}
+
+func (d *Database) BuildDsn() string {
+	if d.Driver == "" {
+		return ""
+	}
+
+	if d.Driver == DatabaseDriverSqlite3 {
+		return fmt.Sprintf("%s?%s", d.Path, d.Options)
+	}
+
+	authPart := ""
+	if d.User != "" || d.Password != "" {
+		authPrefix := url.UserPassword(d.User, d.Password)
+		authPart = fmt.Sprintf("%s@", authPrefix)
+	}
+
+	dbPart := ""
+	if d.Database != "" {
+		dbPart = fmt.Sprintf("/%s", d.Database)
+	}
+
+	optPart := ""
+	if d.Options != "" {
+		optPart = fmt.Sprintf("?%s", d.Options)
+	}
+
+	host := fmt.Sprintf("%s:%d", d.Host, d.Port)
+
+	if d.Host != "localhost" {
+		host = fmt.Sprintf("tcp(%s:%d)", d.Host, d.Port)
+	}
+
+	if d.Driver == DatabaseDriverMySQL {
+		return fmt.Sprintf("%s%s%s%s", authPart, host, dbPart, optPart)
+	}
+
+	return fmt.Sprintf("%s://%s%s%s%s", d.Driver, authPart, host, dbPart, optPart)
 }
