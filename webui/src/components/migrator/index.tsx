@@ -6,7 +6,6 @@ import { Button } from "@/components/ui/button";
 import {
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -35,6 +34,8 @@ const formSchema = z.object({
 });
 
 export default function Migrator() {
+  const [logOpen, setLogOpen] = React.useState(false);
+
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: {
@@ -60,6 +61,7 @@ export default function Migrator() {
     // Do something with the form values.
     // ✅ This will be type-safe and validated.
     console.log(values);
+    setLogOpen(true);
   }
 
   return (
@@ -249,7 +251,7 @@ export default function Migrator() {
           <div className="border-x h-full"></div>
         </div>
       </div>
-      <LogSheet open={true} setOpen={() => {}} />
+      <LogSheet open={logOpen} setOpen={setLogOpen} />
     </>
   );
 }
