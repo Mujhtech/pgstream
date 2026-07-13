@@ -1,8 +1,9 @@
 package server
 
 import (
+	"fmt"
+
 	"github.com/mujhtech/pgstream/config"
-	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
 
@@ -17,14 +18,8 @@ func RegisterServerCommand() *cobra.Command {
 		Use:   "serve",
 		Short: "Start pgstream server",
 		Long:  ``,
-		Run: func(cmd *cobra.Command, args []string) {
-
-			err := startServer(configFile, logLevel)
-
-			if err != nil {
-				log.Err(err).Msg("failed to start server")
-			}
-
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return startServer(configFile, logLevel)
 		},
 	}
 
@@ -36,5 +31,5 @@ func RegisterServerCommand() *cobra.Command {
 }
 
 func startServer(configFile string, logLevel string) error {
-	return nil
+	return fmt.Errorf("server mode is not implemented yet (config %q, log level %q)", configFile, logLevel)
 }

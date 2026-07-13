@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 )
 
@@ -85,34 +86,36 @@ func (d *Database) BuildDsn() string {
 	}
 
 	if d.Driver == DatabaseDriverSqlite3 {
+		if d.Options == "" {
+			return d.Path
+		}
 		return fmt.Sprintf("%s?%s", d.Path, d.Options)
 	}
 
-	authPart := ""
-	if d.User != "" || d.Password != "" {
-		authPrefix := url.UserPassword(d.User, d.Password)
-		authPart = fmt.Sprintf("%s@", authPrefix)
-	}
-
-	dbPart := ""
-	if d.Database != "" {
-		dbPart = fmt.Sprintf("/%s", d.Database)
-	}
-
-	optPart := ""
-	if d.Options != "" {
-		optPart = fmt.Sprintf("?%s", d.Options)
-	}
-
-	host := fmt.Sprintf("%s:%d", d.Host, d.Port)
-
-	if d.Host != "localhost" {
-		host = fmt.Sprintf("tcp(%s:%d)", d.Host, d.Port)
-	}
-
 	if d.Driver == DatabaseDriverMySQL {
-		return fmt.Sprintf("%s%s%s%s", authPart, host, dbPart, optPart)
+		authPart := ""
+		if d.User != "" || d.Password != "" {
+			authPart = fmt.Sprintf("%s:%s@", d.User, d.Password)
+		}
+		databasePart := ""
+		if d.Database != "" {
+			databasePart = "/" + url.PathEscape(d.Database)
+		}
+		optionPart := ""
+		if d.Options != "" {
+			optionPart = "?" + d.Options
+		}
+		return fmt.Sprintf("%stcp(%s)%s%s", authPart, net.JoinHostPort(d.Host, fmt.Sprintf("%d", d.Port)), databasePart, optionPart)
 	}
 
-	return fmt.Sprintf("%s://%s%s%s%s", d.Driver, authPart, host, dbPart, optPart)
+	dsn := &url.URL{
+		Scheme:   string(d.Driver),
+		Host:     net.JoinHostPort(d.Host, fmt.Sprintf("%d", d.Port)),
+		Path:     d.Database,
+		RawQuery: d.Options,
+	}
+	if d.User != "" || d.Password != "" {
+		dsn.User = url.UserPassword(d.User, d.Password)
+	}
+	return dsn.String()
 }

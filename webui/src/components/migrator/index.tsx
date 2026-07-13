@@ -18,16 +18,16 @@ import LogSheet from "./log-sheet";
 const formSchema = z.object({
   mysql: z.object({
     host: z.string().min(1),
-    port: z.number().min(1),
+    port: z.number().int().min(1).max(65535),
     user: z.string().min(1),
-    password: z.string().min(1),
+    password: z.string(),
     database: z.string().min(1),
   }),
   postgres: z.object({
     host: z.string().min(1),
-    port: z.number().min(1),
+    port: z.number().int().min(1).max(65535),
     user: z.string().min(1),
-    password: z.string().min(1),
+    password: z.string(),
     database: z.string().min(1),
     schema: z.string().optional(),
   }),
@@ -57,10 +57,7 @@ export default function Migrator() {
     },
   });
 
-  function onSubmit(values: z.infer<typeof formSchema>) {
-    // Do something with the form values.
-    // ✅ This will be type-safe and validated.
-    console.log(values);
+  function onSubmit() {
     setLogOpen(true);
   }
 
@@ -77,6 +74,7 @@ export default function Migrator() {
               <Form {...form}>
                 <form
                   onSubmit={form.handleSubmit(onSubmit)}
+                  autoComplete="off"
                   className="w-full flex flex-col gap-3"
                 >
                   <div className="grid grid-cols-3 gap-4 p-3 pb-0">
@@ -100,7 +98,21 @@ export default function Migrator() {
                         <FormItem className="col-span-3 md:col-span-1">
                           <FormLabel>MySQL Port</FormLabel>
                           <FormControl>
-                            <Input placeholder="3306" {...field} />
+                            <Input
+                              {...field}
+                              type="number"
+                              min={1}
+                              max={65535}
+                              placeholder="3306"
+                              value={Number.isNaN(field.value) ? "" : field.value}
+                              onChange={(event) =>
+                                field.onChange(
+                                  event.currentTarget.value === ""
+                                    ? Number.NaN
+                                    : event.currentTarget.valueAsNumber,
+                                )
+                              }
+                            />
                           </FormControl>
                           <FormMessage />
                         </FormItem>
@@ -168,7 +180,21 @@ export default function Migrator() {
                         <FormItem className="col-span-4 md:col-span-1">
                           <FormLabel>PostgreSQL Port</FormLabel>
                           <FormControl>
-                            <Input placeholder="3306" {...field} />
+                            <Input
+                              {...field}
+                              type="number"
+                              min={1}
+                              max={65535}
+                              placeholder="5432"
+                              value={Number.isNaN(field.value) ? "" : field.value}
+                              onChange={(event) =>
+                                field.onChange(
+                                  event.currentTarget.value === ""
+                                    ? Number.NaN
+                                    : event.currentTarget.valueAsNumber,
+                                )
+                              }
+                            />
                           </FormControl>
                           <FormMessage />
                         </FormItem>
@@ -233,15 +259,15 @@ export default function Migrator() {
                   </div>
                   <Separator />
                   <div className="px-3 pb-3 flex justify-end">
-                    <Button type="submit">Submit</Button>
+                    <Button type="submit">Review configuration</Button>
                   </div>
                 </form>
               </Form>
             </div>
             <div className="mt-3 flex flex-col items-center justify-center">
               <p className="text-sm text-muted-foreground">
-                This is a beta version of the migrator. It is not fully tested
-                and may not work as expected.
+                The web runner is preview-only. Use the CLI to perform a
+                migration.
               </p>
             </div>
           </div>

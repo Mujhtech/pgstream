@@ -17,10 +17,11 @@ export default function LogSheet({
     <Sheet open={open} onOpenChange={setOpen}>
       <SheetContent className="shadow-none">
         <SheetHeader>
-          <SheetTitle>Are you absolutely sure?</SheetTitle>
+          <SheetTitle>Web migrations are not enabled yet</SheetTitle>
           <SheetDescription>
-            This action cannot be undone. This will permanently delete your
-            account and remove your data from our servers.
+            Your connection details were validated locally and were not sent or
+            logged. Use the pgstream CLI to run the migration while the server
+            API and live progress stream are being completed.
           </SheetDescription>
         </SheetHeader>
       </SheetContent>
