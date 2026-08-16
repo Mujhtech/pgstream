@@ -10,3 +10,6 @@
 
 pgstream
 pgstream.db
+# Local database backups (production data — never commit)
+*.gz
+test_db.gz

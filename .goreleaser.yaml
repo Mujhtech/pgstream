@@ -4,8 +4,11 @@ before:
     - go mod tidy
     - go generate ./...
 builds:
-  - main: ./cmd/main.go
+  - main: ./cmd
     env:
+      # NOTE: the default SQLite metadata storage uses mattn/go-sqlite3,
+      # which requires cgo. Binaries built with CGO_ENABLED=0 must use
+      # PostgreSQL metadata storage (DB_DRIVER=postgres) instead.
       - CGO_ENABLED=0
     goos:
       - linux
