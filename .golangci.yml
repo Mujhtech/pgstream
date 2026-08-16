@@ -1,0 +1,9 @@
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      # Deferred Close on read paths has no meaningful error to handle;
+      # write paths in this codebase check Close explicitly.
+      - linters: [errcheck]
+        source: 'defer .*\.Close\(\)'

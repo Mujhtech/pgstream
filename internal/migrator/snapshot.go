@@ -50,7 +50,7 @@ func (m *Migrator) beginAlignedSnapshots(ctx context.Context, n int) (*sourceSna
 // beginSnapshotsUnderLock opens n snapshots while holding
 // FLUSH TABLES WITH READ LOCK.
 func (m *Migrator) beginSnapshotsUnderLock(ctx context.Context, n int) (*sourceSnapshots, error) {
-	lockConn, err := m.mysql.GetDB().DB.Conn(ctx)
+	lockConn, err := m.mysql.GetDB().Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open snapshot lock connection: %w", err)
 	}

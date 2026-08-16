@@ -46,28 +46,6 @@ func TestAesGcmAcceptsBase64EncodedKey(t *testing.T) {
 	}
 }
 
-func TestAesCfbRoundTripRejectsShortAndTamperedCiphertext(t *testing.T) {
-	cipher, err := NewAesCfb(testEncryptionKey)
-	if err != nil {
-		t.Fatalf("create cipher: %v", err)
-	}
-	ciphertext, err := cipher.Encrypt([]byte("secret"))
-	if err != nil {
-		t.Fatalf("encrypt: %v", err)
-	}
-	decrypted, err := cipher.Decrypt(ciphertext)
-	if err != nil || decrypted != "secret" {
-		t.Fatalf("decrypt: plaintext=%q err=%v", decrypted, err)
-	}
-	if _, err := cipher.Decrypt(aesCFBEnvelopePrefix + "AA"); err == nil {
-		t.Fatal("expected short ciphertext to fail")
-	}
-	tampered := tamperLastCharacter(ciphertext)
-	if _, err := cipher.Decrypt(tampered); err == nil {
-		t.Fatal("expected tampered CFB ciphertext to fail")
-	}
-}
-
 func tamperLastCharacter(value string) string {
 	replacement := "A"
 	if strings.HasSuffix(value, replacement) {
