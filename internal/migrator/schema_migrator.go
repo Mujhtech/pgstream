@@ -486,6 +486,32 @@ func (sm *SchemaMigrator) migrateForeignKeys(ctx context.Context, tableName stri
 			continue
 		}
 
+		// Orphaned child rows (inserted with FOREIGN_KEY_CHECKS=0) make the
+		// constraint uncreatable until the data is repaired; skip it with
+		// its DDL saved for manual work instead of failing the migration.
+		orphans, err := sm.countOrphanRows(ctx, fk)
+		if err != nil {
+			migrationErrors = append(migrationErrors, fmt.Errorf("check foreign key %s for orphaned rows: %w", fk.ConstraintName, err))
+			continue
+		}
+		if orphans > 0 {
+			sm.warnf("⚠️  Skipping foreign key %s on %s: %d child rows have no matching parent in %s (inserted with FOREIGN_KEY_CHECKS=0?); repair them, then run the saved DDL or resume the session", fk.ConstraintName, fk.TableName, orphans, fk.ReferencedTable)
+			sm.appendManual(ManualStatement{
+				Kind:  "foreign_key",
+				Table: fk.TableName,
+				Name:  constraintName,
+				SQL:   sm.buildForeignKeySQL(fk, constraintName),
+				Reason: fmt.Sprintf(
+					"%d rows in %s reference values missing from %s (find them with: SELECT child.* FROM %s child LEFT JOIN %s parent ON child.%s = parent.%s WHERE parent.%s IS NULL AND child.%s IS NOT NULL); repair or delete them, then run this statement",
+					orphans, fk.TableName, fk.ReferencedTable,
+					quoteMySQLIdentifier(fk.TableName), quoteMySQLIdentifier(fk.ReferencedTable),
+					quoteMySQLIdentifier(fk.ColumnNames[0]), quoteMySQLIdentifier(fk.ReferencedColumns[0]),
+					quoteMySQLIdentifier(fk.ReferencedColumns[0]), quoteMySQLIdentifier(fk.ColumnNames[0]),
+				),
+			})
+			continue
+		}
+
 		constraintSQL := sm.buildForeignKeySQL(fk, constraintName)
 
 		if _, err := sm.postgres.ExecContext(ctx, constraintSQL); err != nil {
@@ -612,6 +638,31 @@ func (sm *SchemaMigrator) getMySQLViews(ctx context.Context) ([]ViewInfo, error)
 	return views, nil
 }
 
+// countOrphanRows counts child rows that violate the foreign key in the
+// source itself (inserted under FOREIGN_KEY_CHECKS=0, common in restores).
+// MySQL keeps the constraint as metadata over such rows, but PostgreSQL
+// refuses to create it, so orphans must be found before attempting.
+func (sm *SchemaMigrator) countOrphanRows(ctx context.Context, fk ForeignKeyInfo) (int64, error) {
+	joins := make([]string, len(fk.ColumnNames))
+	notNulls := make([]string, len(fk.ColumnNames))
+	for i := range fk.ColumnNames {
+		joins[i] = fmt.Sprintf("child.%s = parent.%s", quoteMySQLIdentifier(fk.ColumnNames[i]), quoteMySQLIdentifier(fk.ReferencedColumns[i]))
+		notNulls[i] = fmt.Sprintf("child.%s IS NOT NULL", quoteMySQLIdentifier(fk.ColumnNames[i]))
+	}
+	query := fmt.Sprintf(
+		"SELECT COUNT(*) FROM %s child LEFT JOIN %s parent ON %s WHERE parent.%s IS NULL AND %s",
+		quoteMySQLIdentifier(fk.TableName), quoteMySQLIdentifier(fk.ReferencedTable),
+		strings.Join(joins, " AND "),
+		quoteMySQLIdentifier(fk.ReferencedColumns[0]),
+		strings.Join(notNulls, " AND "),
+	)
+	var count int64
+	if err := sm.mysql.QueryRowContext(ctx, query).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 // buildForeignKeySQL renders the ALTER TABLE statement that creates one
 // foreign key constraint in the target schema.
 func (sm *SchemaMigrator) buildForeignKeySQL(fk ForeignKeyInfo, constraintName string) string {
@@ -671,17 +722,20 @@ func (sm *SchemaMigrator) validateForeignKeyColumnTypes(ctx context.Context, fk 
 		}
 
 		message := fmt.Sprintf(
-			"column %s.%s has type %s but referenced column %s.%s has type %s; this usually means the referenced table was migrated after a partial migration had already created the referencing column",
+			"column %s.%s has type %s but referenced column %s.%s has type %s; the target tables were created with diverging type decisions (for example by an earlier pgstream version or a staged partial migration)",
 			fk.TableName, fk.ColumnNames[i], referencingType,
 			fk.ReferencedTable, fk.ReferencedColumns[i], referencedType,
 		)
 		if (referencingType == "varchar" && referencedType == "uuid") || (referencingType == "uuid" && referencedType == "varchar") {
 			varcharTable, varcharColumn := fk.TableName, fk.ColumnNames[i]
+			uuidTable, uuidColumn := fk.ReferencedTable, fk.ReferencedColumns[i]
 			if referencingType == "uuid" {
-				varcharTable, varcharColumn = fk.ReferencedTable, fk.ReferencedColumns[i]
+				varcharTable, varcharColumn, uuidTable, uuidColumn = fk.ReferencedTable, fk.ReferencedColumns[i], fk.TableName, fk.ColumnNames[i]
 			}
 			message += fmt.Sprintf(
-				`; if every value is a UUID, convert it explicitly with: ALTER TABLE %s.%s ALTER COLUMN %s TYPE uuid USING %s::uuid`,
+				`. Reconcile with one of: ALTER TABLE %s.%s ALTER COLUMN %s TYPE varchar(36) USING %s::text (always succeeds), or — only if every value is a canonical UUID — ALTER TABLE %s.%s ALTER COLUMN %s TYPE uuid USING %s::uuid`,
+				quotePostgresIdentifier(sm.schema), quotePostgresIdentifier(uuidTable),
+				quotePostgresIdentifier(uuidColumn), quotePostgresIdentifier(uuidColumn),
 				quotePostgresIdentifier(sm.schema), quotePostgresIdentifier(varcharTable),
 				quotePostgresIdentifier(varcharColumn), quotePostgresIdentifier(varcharColumn),
 			)

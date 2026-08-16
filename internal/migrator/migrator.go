@@ -225,6 +225,12 @@ func (m *Migrator) Start(ctx context.Context) error {
 		m.logf("📋 Found %d tables to migrate\n", len(tables))
 	}
 
+	// Native-UUID conversion is decided once, per foreign-key-connected
+	// group, before any table is created.
+	if err := m.resolveUUIDConversions(ctx, tables); err != nil {
+		return fmt.Errorf("resolve UUID conversions: %w", err)
+	}
+
 	// Step 3: Create all tables in PostgreSQL (structure only)
 	m.logf("🏗️  Step 1: Creating table structures...")
 	schemaPhaseStart := time.Now()

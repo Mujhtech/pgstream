@@ -77,6 +77,9 @@ type ForeignKeyPlan struct {
 	// DDL to run once the referenced table is available.
 	SourceMissing bool   `json:"source_missing,omitempty"`
 	SQL           string `json:"sql,omitempty"`
+	// OrphanRows counts child rows violating the constraint in the source;
+	// the constraint is skipped and saved for manual work until repaired.
+	OrphanRows int64 `json:"orphan_rows,omitempty"`
 }
 
 // DryRun computes the full migration plan by reading MySQL metadata only.
@@ -109,6 +112,10 @@ func (m *Migrator) DryRun(ctx context.Context) (*DryRunReport, error) {
 		return nil, err
 	}
 	report.SelectedTables = len(tables)
+
+	if err := m.resolveUUIDConversions(ctx, tables); err != nil {
+		report.Issues = append(report.Issues, fmt.Sprintf("resolve UUID conversions: %v", err))
+	}
 
 	if m.filter.active() {
 		if err := m.validateForeignKeyClosure(ctx, tables); err != nil {
@@ -315,6 +322,15 @@ func (m *Migrator) dryRunTable(ctx context.Context, table string, engine string,
 		if plan.SourceMissing {
 			plan.SQL = m.schemaMigrator.buildForeignKeySQL(fk, plan.Name)
 			tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("foreign key %s references table %s, which does not exist in the source database (partial backup?); the constraint will be skipped and its DDL saved for manual work", fk.ConstraintName, fk.ReferencedTable))
+		} else {
+			orphans, err := m.schemaMigrator.countOrphanRows(ctx, fk)
+			if err != nil {
+				tableReport.Issues = append(tableReport.Issues, fmt.Sprintf("check foreign key %s for orphaned rows: %v", fk.ConstraintName, err))
+			} else if orphans > 0 {
+				plan.OrphanRows = orphans
+				plan.SQL = m.schemaMigrator.buildForeignKeySQL(fk, plan.Name)
+				tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("foreign key %s has %d child rows with no matching parent in %s; the constraint will be skipped and its DDL saved for manual work until the rows are repaired", fk.ConstraintName, orphans, fk.ReferencedTable))
+			}
 		}
 		tableReport.ForeignKeys = append(tableReport.ForeignKeys, plan)
 	}

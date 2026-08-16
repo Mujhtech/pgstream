@@ -12,10 +12,18 @@ import (
 // storing the data losslessly is the requirement.
 const uuidPattern = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 
+type uuidDecision struct {
+	convert bool
+	reason  string
+}
+
 type uuidDataCheck struct {
 	mu     sync.Mutex
 	counts map[string]int64 // "table\x00column" -> rows that cannot convert
 	warned map[string]bool  // demotion warned once per column
+	// decisions holds group-wise conversion outcomes computed by
+	// resolveUUIDConversions; when present it overrides per-table checks.
+	decisions map[string]uuidDecision
 }
 
 func uuidCacheKey(table, column string) string {
@@ -136,6 +144,33 @@ func (m *Migrator) applyUUIDDataCheck(ctx context.Context, table string, columns
 		return nil
 	}
 
+	// Group-wise decisions from resolveUUIDConversions are authoritative:
+	// they account for every foreign-key-connected column, not just this
+	// table's data.
+	m.uuidCheck.mu.Lock()
+	decisions := m.uuidCheck.decisions
+	m.uuidCheck.mu.Unlock()
+	if decisions != nil {
+		for i := range columns {
+			col := &columns[i]
+			if !col.IsUUID {
+				continue
+			}
+			decision, known := decisions[uuidCacheKey(table, col.Name)]
+			if known && decision.convert {
+				continue
+			}
+			col.IsUUID = false
+			if known {
+				col.UUIDDemotionReason = decision.reason
+			} else {
+				col.UUIDDemotionReason = "column was not part of the resolved conversion set; keeping the original type"
+			}
+			m.warnUUIDDemotion(table, col.Name, col.UUIDDemotionReason)
+		}
+		return nil
+	}
+
 	ownCounts, err := m.uuidInvalidCounts(ctx, table, candidates)
 	if err != nil {
 		return err
@@ -192,4 +227,184 @@ func (m *Migrator) warnUUIDDemotion(table, column, reason string) {
 	if !alreadyWarned {
 		m.warnf("⚠️  Column %s.%s looks like a UUID column by shape, but %s", table, column, reason)
 	}
+}
+
+// resolveUUIDConversions decides UUID conversion for every candidate column
+// across the selected tables as foreign-key-connected groups: two columns
+// joined by a foreign key must share one type, so a group converts to native
+// UUID only when every member's data converts. A single dirty column keeps
+// its whole key group on VARCHAR, which is lossless and keeps constraints
+// creatable.
+func (m *Migrator) resolveUUIDConversions(ctx context.Context, tables []string) error {
+	selected := make(map[string]bool, len(tables))
+	for _, table := range tables {
+		selected[strings.ToLower(table)] = true
+	}
+
+	// Candidate columns: UUID storage shape, and either a primary key or
+	// referencing a UUID-storage column (the same rule the per-column
+	// heuristic uses).
+	type candidate struct {
+		table, column, columnType string
+		primary                   bool
+	}
+	var candidates []candidate
+	rows, err := m.sourceQueryer(ctx).QueryContext(ctx, `
+		SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+	`)
+	if err != nil {
+		return fmt.Errorf("list UUID candidate columns: %w", err)
+	}
+	for rows.Next() {
+		var table, column, columnType, columnKey string
+		if err := rows.Scan(&table, &column, &columnType, &columnKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if selected[strings.ToLower(table)] && isUUIDStorageType(columnType) {
+			candidates = append(candidates, candidate{table: table, column: column, columnType: columnType, primary: columnKey == "PRI"})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+
+	// Foreign-key edges between UUID-storage columns of selected tables.
+	type edge struct{ from, to string }
+	var edges []edge
+	rows, err = m.sourceQueryer(ctx).QueryContext(ctx, `
+		SELECT key_info.TABLE_NAME, key_info.COLUMN_NAME,
+			key_info.REFERENCED_TABLE_NAME, key_info.REFERENCED_COLUMN_NAME,
+			referencing_column.COLUMN_TYPE, referenced_column.COLUMN_TYPE
+		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE key_info
+		JOIN INFORMATION_SCHEMA.COLUMNS referencing_column
+			ON referencing_column.TABLE_SCHEMA = key_info.TABLE_SCHEMA
+			AND referencing_column.TABLE_NAME = key_info.TABLE_NAME
+			AND referencing_column.COLUMN_NAME = key_info.COLUMN_NAME
+		JOIN INFORMATION_SCHEMA.COLUMNS referenced_column
+			ON referenced_column.TABLE_SCHEMA = key_info.REFERENCED_TABLE_SCHEMA
+			AND referenced_column.TABLE_NAME = key_info.REFERENCED_TABLE_NAME
+			AND referenced_column.COLUMN_NAME = key_info.REFERENCED_COLUMN_NAME
+		WHERE key_info.TABLE_SCHEMA = DATABASE()
+		AND key_info.REFERENCED_TABLE_NAME IS NOT NULL
+	`)
+	if err != nil {
+		return fmt.Errorf("list UUID foreign-key edges: %w", err)
+	}
+	referencesUUID := make(map[string]bool)
+	for rows.Next() {
+		var fromTable, fromColumn, toTable, toColumn, fromType, toType string
+		if err := rows.Scan(&fromTable, &fromColumn, &toTable, &toColumn, &fromType, &toType); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if !selected[strings.ToLower(fromTable)] || !selected[strings.ToLower(toTable)] {
+			continue
+		}
+		if !isUUIDStorageType(fromType) || !isUUIDStorageType(toType) {
+			continue
+		}
+		referencesUUID[uuidCacheKey(fromTable, fromColumn)] = true
+		edges = append(edges, edge{from: uuidCacheKey(fromTable, fromColumn), to: uuidCacheKey(toTable, toColumn)})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+
+	// Keep only real candidates (primary keys or FK columns referencing
+	// UUID-storage keys) as group members.
+	members := make(map[string]candidate)
+	for _, cand := range candidates {
+		key := uuidCacheKey(cand.table, cand.column)
+		if cand.primary || referencesUUID[key] {
+			members[key] = cand
+		}
+	}
+	if len(members) == 0 {
+		return nil
+	}
+
+	// Union-find over the FK edges.
+	parent := make(map[string]string, len(members))
+	var find func(string) string
+	find = func(node string) string {
+		if parent[node] != node {
+			parent[node] = find(parent[node])
+		}
+		return parent[node]
+	}
+	for key := range members {
+		parent[key] = key
+	}
+	for _, e := range edges {
+		if _, ok := members[e.from]; !ok {
+			continue
+		}
+		if _, ok := members[e.to]; !ok {
+			continue
+		}
+		parent[find(e.from)] = find(e.to)
+	}
+
+	// Data-check every member, batched per table.
+	byTable := make(map[string][]ColumnInfo)
+	for _, cand := range members {
+		byTable[cand.table] = append(byTable[cand.table], ColumnInfo{Name: cand.column, Type: cand.columnType})
+	}
+	invalid := make(map[string]int64, len(members))
+	for table, cols := range byTable {
+		counts, err := m.uuidInvalidCounts(ctx, table, cols)
+		if err != nil {
+			return err
+		}
+		for column, count := range counts {
+			invalid[uuidCacheKey(table, column)] = count
+		}
+	}
+
+	// A group converts only when every member is clean; otherwise every
+	// member keeps VARCHAR with a reason naming the dirty column.
+	dirtyByRoot := make(map[string]string)
+	for key, cand := range members {
+		if invalid[key] > 0 {
+			root := find(key)
+			if _, exists := dirtyByRoot[root]; !exists {
+				dirtyByRoot[root] = fmt.Sprintf("%s.%s", cand.table, cand.column)
+			}
+		}
+	}
+
+	decisions := make(map[string]uuidDecision, len(members))
+	for key, cand := range members {
+		root := find(key)
+		dirty, groupDirty := dirtyByRoot[root]
+		switch {
+		case !groupDirty:
+			decisions[key] = uuidDecision{convert: true}
+		case invalid[key] > 0:
+			decisions[key] = uuidDecision{convert: false, reason: fmt.Sprintf(
+				"%d rows contain values that are not canonical UUIDs (inspect with: SELECT %s FROM %s WHERE %s IS NOT NULL AND %s NOT REGEXP '%s' LIMIT 5); keeping the original type",
+				invalid[key], quoteMySQLIdentifier(cand.column), quoteMySQLIdentifier(cand.table), quoteMySQLIdentifier(cand.column), quoteMySQLIdentifier(cand.column), uuidPattern,
+			)}
+		default:
+			decisions[key] = uuidDecision{convert: false, reason: fmt.Sprintf(
+				"foreign-key-connected column %s contains non-UUID values, so the whole key group keeps its original type to stay constraint-compatible", dirty,
+			)}
+		}
+	}
+
+	m.uuidCheck.mu.Lock()
+	if m.uuidCheck.counts == nil {
+		m.uuidCheck.counts = make(map[string]int64)
+		m.uuidCheck.warned = make(map[string]bool)
+	}
+	m.uuidCheck.decisions = decisions
+	m.uuidCheck.mu.Unlock()
+	return nil
 }
