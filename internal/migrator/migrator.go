@@ -24,6 +24,7 @@ type Migrator struct {
 	batchSize      int
 	freshSession   bool
 	filter         *tableFilter
+	casts          *castRules
 	loadMethod     LoadMethod
 	sink           EventSink
 	workers        int

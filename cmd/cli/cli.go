@@ -34,6 +34,7 @@ type sessionOptions struct {
 	workers           int
 	skipSnapshotLock  bool
 	sourceCompression bool
+	casts             []string
 }
 
 func RegisterCliCommand() *cobra.Command {
@@ -86,6 +87,7 @@ func RegisterCliCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.loadMethod, "load-method", string(migrator.LoadMethodCopy), "how batches are written to PostgreSQL: copy or insert")
 	cmd.Flags().IntVar(&opts.workers, "workers", 1, "tables migrated concurrently; workers > 1 aligns per-worker snapshots under a brief FLUSH TABLES WITH READ LOCK")
 	cmd.Flags().BoolVar(&opts.skipSnapshotLock, "skip-snapshot-lock", false, "skip the snapshot alignment lock; only safe when the source receives no writes during the migration")
+	cmd.Flags().StringArrayVar(&opts.casts, "cast", nil, "type-mapping override, repeatable: 'table.column=TYPE' or 'mysqltype=TYPE' (e.g. --cast 'jobs.id=text' --cast 'datetime=timestamptz')")
 	cmd.Flags().BoolVar(&opts.sourceCompression, "source-compression", true, "zlib-compress the MySQL connection; a large win for remote sources, disable with --source-compression=false")
 	cmd.MarkFlagsMutuallyExclusive("include-tables", "exclude-tables")
 
@@ -258,6 +260,7 @@ func cliSession(ctx context.Context, storage *storage.Storage, sessionCipher enc
 		migrator.WithLoadMethod(migrator.LoadMethod(opts.loadMethod)),
 		migrator.WithWorkers(opts.workers),
 		migrator.WithSkipSnapshotLock(opts.skipSnapshotLock),
+		migrator.WithCastRules(opts.casts),
 	}
 
 	// Persist engine events so the server, web UI, and `pgstream status`

@@ -321,6 +321,15 @@ func (m *Migrator) getMySQLTableStructure(ctx context.Context, table string) ([]
 	if len(columns) == 0 {
 		return nil, fmt.Errorf("table %q has no columns or does not exist", table)
 	}
+	// User cast rules are authoritative: they replace the built-in mapping
+	// and exempt the column from UUID conversion.
+	for i := range columns {
+		if target := m.casts.lookup(table, columns[i].Name, columns[i].Type); target != "" {
+			columns[i].CastType = target
+			columns[i].IsUUID = false
+		}
+	}
+
 	// UUID conversion is a schema-shape heuristic; the data decides whether
 	// it is actually safe. Columns whose values cannot convert keep their
 	// original lossless type.
@@ -346,6 +355,9 @@ type ColumnInfo struct {
 	// shape but its data (or its referenced column's data) cannot convert,
 	// so it keeps its original type.
 	UUIDDemotionReason string
+	// CastType carries a user cast rule's target type; it replaces the
+	// built-in mapping and exempts the column from UUID conversion.
+	CastType string
 }
 
 // isGeneratedColumn reports whether EXTRA marks a MySQL VIRTUAL or STORED

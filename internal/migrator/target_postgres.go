@@ -614,12 +614,18 @@ func (m *Migrator) buildCreateTableSQL(table string, columns []ColumnInfo) (stri
 // definition, returning the resolved PostgreSQL type alongside the DDL
 // fragment.
 func (m *Migrator) buildColumnDefinition(table string, col ColumnInfo) (string, string, error) {
-	pgType, err := m.convertMySQLTypeToPostgres(col.Type, col.Name, table)
-	if err != nil {
-		return "", "", fmt.Errorf("column %s: %w", col.Name, err)
-	}
-	if col.IsUUID {
-		pgType = "UUID"
+	var pgType string
+	if col.CastType != "" {
+		pgType = strings.ToUpper(col.CastType)
+	} else {
+		var err error
+		pgType, err = m.convertMySQLTypeToPostgres(col.Type, col.Name, table)
+		if err != nil {
+			return "", "", fmt.Errorf("column %s: %w", col.Name, err)
+		}
+		if col.IsUUID {
+			pgType = "UUID"
+		}
 	}
 
 	def := fmt.Sprintf(`%s %s`, quotePostgresIdentifier(col.Name), pgType)
@@ -673,7 +679,7 @@ var numericDefaultPattern = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[
 func postgresDefaultValue(value string, postgresType string, extra string) (string, error) {
 	trimmed := strings.TrimSpace(value)
 	upper := strings.ToUpper(trimmed)
-	temporalType := postgresType == "DATE" || postgresType == "TIME" || postgresType == "TIMESTAMP"
+	temporalType := strings.HasPrefix(postgresType, "DATE") || strings.HasPrefix(postgresType, "TIME")
 	if temporalType && (upper == "CURRENT_TIMESTAMP" || strings.HasPrefix(upper, "CURRENT_TIMESTAMP(")) {
 		return "CURRENT_TIMESTAMP", nil
 	}

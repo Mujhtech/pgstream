@@ -72,6 +72,9 @@ type sessionRequest struct {
 	// DisableSourceCompression opts out of MySQL wire compression (on by
 	// default; the zero value keeps it enabled).
 	DisableSourceCompression bool `json:"disable_source_compression,omitempty"`
+	// Casts are pgloader-style type overrides: "table.column=TYPE" or
+	// "mysqltype=TYPE".
+	Casts []string `json:"casts,omitempty"`
 }
 
 type resumeRequest struct {
@@ -82,6 +85,7 @@ type resumeRequest struct {
 	Workers                  int      `json:"workers,omitempty"`
 	SkipSnapshotLock         bool     `json:"skip_snapshot_lock,omitempty"`
 	DisableSourceCompression bool     `json:"disable_source_compression,omitempty"`
+	Casts                    []string `json:"casts,omitempty"`
 }
 
 type runOptions struct {
@@ -92,6 +96,7 @@ type runOptions struct {
 	workers                  int
 	skipSnapshotLock         bool
 	disableSourceCompression bool
+	casts                    []string
 	fresh                    bool
 }
 
@@ -304,6 +309,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		workers:                  request.Workers,
 		skipSnapshotLock:         request.SkipSnapshotLock,
 		disableSourceCompression: request.DisableSourceCompression,
+		casts:                    request.Casts,
 		fresh:                    true,
 	}
 	if err := s.startRun(sessionID, inputs, options); err != nil {
@@ -343,6 +349,7 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request) {
 		workers:                  request.Workers,
 		skipSnapshotLock:         request.SkipSnapshotLock,
 		disableSourceCompression: request.DisableSourceCompression,
+		casts:                    request.Casts,
 		fresh:                    false,
 	}
 	if err := s.startRun(sessionID, inputs, options); err != nil {
@@ -491,6 +498,7 @@ func (s *Server) executeMigration(ctx context.Context, sessionID string, inputs 
 		migrator.WithEventSink(sink),
 		migrator.WithTableFilter(options.includeTables, options.excludeTables),
 		migrator.WithSkipSnapshotLock(options.skipSnapshotLock),
+		migrator.WithCastRules(options.casts),
 	}
 	if options.workers > 0 {
 		migratorOptions = append(migratorOptions, migrator.WithWorkers(options.workers))
@@ -557,6 +565,7 @@ func (s *Server) handleDryRun(w http.ResponseWriter, r *http.Request) {
 
 	options := []migrator.Option{
 		migrator.WithTableFilter(request.IncludeTables, request.ExcludeTables),
+		migrator.WithCastRules(request.Casts),
 	}
 	if request.LoadMethod != "" {
 		options = append(options, migrator.WithLoadMethod(migrator.LoadMethod(request.LoadMethod)))

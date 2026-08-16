@@ -255,6 +255,9 @@ func (m *Migrator) dryRunTable(ctx context.Context, table string, engine string,
 		if isGeneratedColumn(col.Extra) {
 			tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("column %s is a MySQL generated column (%s); it will migrate as a plain column holding the computed snapshot values, with a translation template in the manual work file", col.Name, col.GenerationExpression))
 		}
+		if col.CastType != "" {
+			tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("column %s mapped by cast rule to %s (replaces the built-in %s mapping)", col.Name, col.CastType, col.Type))
+		}
 		if col.UUIDDemotionReason != "" {
 			tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("column %s looks like a UUID column by shape, but %s", col.Name, col.UUIDDemotionReason))
 		}

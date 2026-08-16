@@ -263,7 +263,7 @@ func (m *Migrator) resolveUUIDConversions(ctx context.Context, tables []string) 
 			_ = rows.Close()
 			return err
 		}
-		if selected[strings.ToLower(table)] && isUUIDStorageType(columnType) {
+		if selected[strings.ToLower(table)] && isUUIDStorageType(columnType) && m.casts.lookup(table, column, columnType) == "" {
 			candidates = append(candidates, candidate{table: table, column: column, columnType: columnType, primary: columnKey == "PRI"})
 		}
 	}
@@ -306,6 +306,9 @@ func (m *Migrator) resolveUUIDConversions(ctx context.Context, tables []string) 
 			continue
 		}
 		if !isUUIDStorageType(fromType) || !isUUIDStorageType(toType) {
+			continue
+		}
+		if m.casts.lookup(fromTable, fromColumn, fromType) != "" || m.casts.lookup(toTable, toColumn, toType) != "" {
 			continue
 		}
 		referencesUUID[uuidCacheKey(fromTable, fromColumn)] = true
