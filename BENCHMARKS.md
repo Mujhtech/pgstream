@@ -1,6 +1,6 @@
 # Benchmarks
 
-Measured on a real production database backup (7 tables, ~1.6M rows, ~2.35GB of InnoDB data, dominated by a 1.34M-row API-log table with three `longtext` columns per row). The dataset also carried real-world warts — `varchar(36)` UUID primary keys, `decimal(30,16)` money columns, seven `ENUM` columns including one containing MySQL's empty-string invalid-enum marker, and eight foreign keys pointing at tables absent from the backup. Table names below are anonymized; row counts, sizes, and timings are as measured.
+Measured on a real production database backup (7 tables, ~1.6M rows, ~2.35GB of InnoDB data, dominated by a 1.34M-row API-log table with three `longtext` columns per row). The dataset also carried real-world warts — `varchar(36)` UUID primary keys, `decimal(30,16)` money columns, seven `ENUM` columns including one containing MySQL's empty-string invalid-enum marker, and eight foreign keys pointing at tables absent from the backup. Table names below are anonymized; row counts, sizes, and timings are as measured. A later run of the **complete 83-table production database over the network** is reported in its own section below.
 
 ## Environment
 
@@ -45,6 +45,24 @@ Both load methods were verified against the MySQL source after migration:
 2. **Partial backups with dangling foreign keys.** 8 FK constraints referenced tables that don't exist in the source. pgstream previously failed at the schema-object stage after copying all data. It now skips constraints whose referenced table is missing **from the source** (they are unenforceable anywhere), warns loudly, and writes their exact `ALTER TABLE ... ADD CONSTRAINT` DDL to `pgstream-manual-<session>.sql` for later execution. `--dry-run` reports the same statements up front. Re-running the same session after restoring the missing tables retries them automatically.
 3. **Staged partial migrations split UUID types.** When the missing tables are restored and the session resumed, their `varchar(36)` primary keys convert to native `UUID` — but the referencing columns were already migrated as `VARCHAR(36)` back when the target tables were absent. FK creation between `uuid` and `varchar` is impossible, so pgstream now pre-checks column-type compatibility and fails with the exact remediation statement (`ALTER TABLE ... ALTER COLUMN ... TYPE uuid USING ...::uuid`). Applying the suggested casts and resuming created all 12 constraints in the end-to-end test.
 4. **MySQL's empty-string invalid-enum marker.** One production row held `''` in a `NOT NULL` enum column — MySQL's artifact for invalid inserts in non-strict mode. pgstream now detects the marker in source data, adds `''` as a label to the created PostgreSQL enum type so every row copies losslessly, and warns to clean the rows up after migration. `--dry-run` reports the same finding before any writes.
+
+## Full production database over the network
+
+The complete production database behind the backup above — **83 tables, 8,539,914 rows**, on managed MySQL (RDS) reached over a WAN — migrated end to end in **10m8s** with zero manual intervention:
+
+| Phase | Wall time |
+| --- | --- |
+| Table structures (incl. enum types and comments) | 1m12s |
+| Data copy (`--workers 5 --batch-size 10000`) | 5m53s — **24,194 rows/s aggregate** |
+| ~160 secondary indexes and 135 foreign keys | 2m30s |
+
+COPY loading and wire compression were at their defaults. `FLUSH TABLES WITH READ LOCK` is denied on RDS, so the five worker snapshots aligned **lock-free**, verified by an unchanged binlog position across the snapshot window.
+
+What the run confirmed:
+
+- **The largest table still bounds the wall clock.** The data phase took 5m53s; the dominant table (`api_request_logs`, 2,078,212 rows) alone took 5m47s. The other 82 tables — 6.5M rows — finished entirely inside its shadow, exactly the `--workers` ceiling described below. Aggregate throughput was still ~7× the earlier single-worker WAN figure, because everything else rode along for free.
+- **The copy stayed network-bound.** Source read was 87–100% of every per-table time breakdown; target write never exceeded 25%. Per-table throughput spanned 126 rows/s (a small table of very wide rows) to 18,355 rows/s (a 971,560-row narrow token table) — rows/s is a row-shape-dependent metric.
+- **Every data-quality safeguard fired on real data in a single run**: six enum columns carrying MySQL's empty-string invalid-enum marker (from 1 to 201 rows each); four `varchar(36)` id columns kept as varchar because a data scan proved they are not UUIDs; one UUID-shaped key group anchored to varchar by a `varchar(255)` foreign-key column (the mixed-shape constraint case); zero dates migrated as NULL in two temporal columns; two keyless tables copied in one streaming pass; and 7 objects (`ON UPDATE CURRENT_TIMESTAMP` trigger DDL, one generated column) written to the manual-work file for review. All 135 satisfiable foreign keys were created on the first attempt.
 
 ## Concurrency (pipeline and `--workers`)
 
