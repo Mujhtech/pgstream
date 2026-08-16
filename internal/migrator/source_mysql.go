@@ -182,19 +182,61 @@ func (m *Migrator) sourceZeroDateCounts(ctx context.Context, table string, colum
 			temporal = append(temporal, col.Name)
 		}
 	}
-	if len(temporal) == 0 {
+	return m.sourceConditionCounts(ctx, table, temporal, func(quoted string) string {
+		return fmt.Sprintf("COALESCE(SUM(CAST(%s AS CHAR) LIKE '0000-00-00%%'), 0)", quoted)
+	})
+}
+
+// sourceNullByteCounts counts rows holding NUL (0x00) bytes per text-bound
+// column in one table scan. Binary-bound columns (blob/binary) are excluded:
+// bytea holds NUL fine.
+func (m *Migrator) sourceNullByteCounts(ctx context.Context, table string, columns []ColumnInfo) (map[string]int64, error) {
+	var textual []string
+	for _, col := range columns {
+		lower := strings.ToLower(col.Type)
+		if strings.Contains(lower, "binary") || strings.Contains(lower, "blob") {
+			continue
+		}
+		if strings.Contains(lower, "char") || strings.Contains(lower, "text") || strings.HasPrefix(lower, "enum") || strings.HasPrefix(lower, "set") {
+			textual = append(textual, col.Name)
+		}
+	}
+	return m.sourceConditionCounts(ctx, table, textual, func(quoted string) string {
+		return fmt.Sprintf("COALESCE(SUM(INSTR(%s, CHAR(0x00)) > 0), 0)", quoted)
+	})
+}
+
+// sourceTimeRangeCounts counts, per TIME column, values outside PostgreSQL's
+// 00:00:00..23:59:59 day-clock range (MySQL TIME is a duration spanning
+// -838:59:59..838:59:59). Columns cast away from TIME are skipped — the cast
+// target (typically interval) holds the values fine.
+func (m *Migrator) sourceTimeRangeCounts(ctx context.Context, table string, columns []ColumnInfo) (map[string]int64, error) {
+	var timeColumns []string
+	for _, col := range columns {
+		lower := strings.ToLower(col.Type)
+		if strings.HasPrefix(lower, "time") && !strings.HasPrefix(lower, "timestamp") && col.CastType == "" {
+			timeColumns = append(timeColumns, col.Name)
+		}
+	}
+	return m.sourceConditionCounts(ctx, table, timeColumns, func(quoted string) string {
+		return fmt.Sprintf("COALESCE(SUM(%s < '00:00:00' OR %s > '23:59:59.999999'), 0)", quoted, quoted)
+	})
+}
+
+// sourceConditionCounts evaluates one aggregate expression per column in a
+// single scan of the table, returning the counts keyed by column name.
+func (m *Migrator) sourceConditionCounts(ctx context.Context, table string, columns []string, expression func(quotedColumn string) string) (map[string]int64, error) {
+	if len(columns) == 0 {
 		return nil, nil
 	}
-
-	selects := make([]string, len(temporal))
-	for i, column := range temporal {
-		quoted := quoteMySQLIdentifier(column)
-		selects[i] = fmt.Sprintf("COALESCE(SUM(CAST(%s AS CHAR) LIKE '0000-00-00%%'), 0)", quoted)
+	selects := make([]string, len(columns))
+	for i, column := range columns {
+		selects[i] = expression(quoteMySQLIdentifier(column))
 	}
 	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selects, ", "), quoteMySQLIdentifier(table))
 
-	counts := make([]int64, len(temporal))
-	dests := make([]any, len(temporal))
+	counts := make([]int64, len(columns))
+	dests := make([]any, len(columns))
 	for i := range counts {
 		dests[i] = &counts[i]
 	}
@@ -202,8 +244,8 @@ func (m *Migrator) sourceZeroDateCounts(ctx context.Context, table string, colum
 		return nil, err
 	}
 
-	result := make(map[string]int64, len(temporal))
-	for i, column := range temporal {
+	result := make(map[string]int64, len(columns))
+	for i, column := range columns {
 		result[column] = counts[i]
 	}
 	return result, nil

@@ -34,8 +34,9 @@ type Migrator struct {
 	metadataMu     sync.RWMutex
 	metadataCache  map[string]*tableValidationMetadata
 	uuidCheck      uuidDataCheck
-	zeroDateMu     sync.Mutex
-	zeroDateWarned map[string]bool
+	unsignedCheck  unsignedBigintCheck
+	warnOnceMu     sync.Mutex
+	warnedOnce     map[string]bool
 	// rowsCopiedThisRun counts rows loaded by the current Start invocation
 	// across all workers, for run-level throughput reporting.
 	rowsCopiedThisRun atomic.Int64
@@ -233,6 +234,9 @@ func (m *Migrator) Start(ctx context.Context) error {
 	// group, before any table is created.
 	if err := m.resolveUUIDConversions(ctx, tables); err != nil {
 		return fmt.Errorf("resolve UUID conversions: %w", err)
+	}
+	if err := m.resolveUnsignedBigintConversions(ctx, tables); err != nil {
+		return fmt.Errorf("resolve BIGINT UNSIGNED conversions: %w", err)
 	}
 
 	// Step 3: Create all tables in PostgreSQL (structure only). A data-only

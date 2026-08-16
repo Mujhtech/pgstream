@@ -116,6 +116,9 @@ func (m *Migrator) DryRun(ctx context.Context) (*DryRunReport, error) {
 	if err := m.resolveUUIDConversions(ctx, tables); err != nil {
 		report.Issues = append(report.Issues, fmt.Sprintf("resolve UUID conversions: %v", err))
 	}
+	if err := m.resolveUnsignedBigintConversions(ctx, tables); err != nil {
+		report.Issues = append(report.Issues, fmt.Sprintf("resolve BIGINT UNSIGNED conversions: %v", err))
+	}
 
 	if m.filter.active() {
 		if err := m.validateForeignKeyClosure(ctx, tables); err != nil {
@@ -202,6 +205,9 @@ func (m *Migrator) dryRunTable(ctx context.Context, table string, engine string,
 		if err := m.verifyExistingUUIDDecisions(ctx, table); err != nil {
 			tableReport.Issues = append(tableReport.Issues, err.Error())
 		}
+		if err := m.verifyExistingUnsignedDecisions(ctx, table); err != nil {
+			tableReport.Issues = append(tableReport.Issues, err.Error())
+		}
 	}
 
 	// One table scan covers the empty-marker check for every enum column.
@@ -234,6 +240,31 @@ func (m *Migrator) dryRunTable(ctx context.Context, table string, engine string,
 		}
 	}
 
+	// One scan counts NUL (0x00) bytes per text column; PostgreSQL text
+	// cannot store them, so the copy removes them with a warning.
+	nullByteCounts, err := m.sourceNullByteCounts(ctx, table, columns)
+	if err != nil {
+		tableReport.Issues = append(tableReport.Issues, fmt.Sprintf("inspect text columns: %v", err))
+	}
+	for _, col := range columns {
+		if count := nullByteCounts[col.Name]; count > 0 {
+			tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("column %s has %d rows containing NUL (0x00) bytes; PostgreSQL text cannot store them, so they will be removed during copy (find them with: SELECT * FROM %s WHERE INSTR(%s, CHAR(0x00)) > 0)", col.Name, count, quoteMySQLIdentifier(table), quoteMySQLIdentifier(col.Name)))
+		}
+	}
+
+	// One scan counts TIME values outside PostgreSQL's day-clock range; the
+	// migration stops on them, so the plan flags them as blocking with the
+	// interval escape hatch.
+	timeRangeCounts, err := m.sourceTimeRangeCounts(ctx, table, columns)
+	if err != nil {
+		tableReport.Issues = append(tableReport.Issues, fmt.Sprintf("inspect time columns: %v", err))
+	}
+	for _, col := range columns {
+		if count := timeRangeCounts[col.Name]; count > 0 {
+			tableReport.Issues = append(tableReport.Issues, fmt.Sprintf("column %s has %d rows with TIME values outside PostgreSQL's 00:00:00-23:59:59 range (MySQL TIME is a duration spanning -838:59:59 to 838:59:59); the migration will stop on them — migrate the column losslessly with --cast '%s.%s=interval' or fix the data", col.Name, count, table, col.Name))
+		}
+	}
+
 	buildable := true
 	for _, col := range columns {
 		columnReport := ColumnDryRun{
@@ -260,6 +291,13 @@ func (m *Migrator) dryRunTable(ctx context.Context, table string, engine string,
 		}
 		if col.UUIDDemotionReason != "" {
 			tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("column %s looks like a UUID column by shape, but %s", col.Name, col.UUIDDemotionReason))
+		}
+		if isUnsignedBigintType(col.Type) && col.CastType == "" {
+			if m.demotedUnsignedBigint(table, col.Name) {
+				tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("column %s is BIGINT UNSIGNED with all data verified within the signed 63-bit range; it maps to BIGINT (identity- and foreign-key-compatible) instead of NUMERIC(20)", col.Name))
+			} else if maxValue, kept := m.unsignedCheck.overflowMax[unsignedKey(table, col.Name)]; kept {
+				tableReport.Warnings = append(tableReport.Warnings, fmt.Sprintf("column %s is BIGINT UNSIGNED holding values above the signed 63-bit range (max %s); it keeps the lossless NUMERIC(20) mapping, which cannot back AUTO_INCREMENT or foreign keys to integer columns", col.Name, maxValue))
+			}
 		}
 
 		if strings.Contains(strings.ToLower(col.Type), "enum") {

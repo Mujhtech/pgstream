@@ -788,6 +788,14 @@ func (m *Migrator) convertMySQLTypeToPostgres(mysqlType string, columnName strin
 	case strings.Contains(mysqlTypeLower, "int"):
 		if strings.Contains(mysqlTypeLower, "bigint") {
 			if strings.Contains(mysqlTypeLower, "unsigned") {
+				// NUMERIC(20) is the lossless mapping (0..2^64-1), but the
+				// resolver demotes to BIGINT when a data scan proved the
+				// column's foreign-key group fits the signed range — numeric
+				// can neither back an identity sequence nor join a foreign
+				// key against integer columns.
+				if m.demotedUnsignedBigint(tableName, columnName) {
+					return "BIGINT", nil
+				}
 				return "NUMERIC(20)", nil
 			}
 			return "BIGINT", nil
@@ -904,7 +912,78 @@ func (m *Migrator) verifyExistingTable(ctx context.Context, table string) error 
 	if err := m.ensurePrimaryKey(ctx, table); err != nil {
 		return fmt.Errorf("failed to ensure primary key for %s: %w", table, err)
 	}
-	return m.verifyExistingUUIDDecisions(ctx, table)
+	if err := m.verifyExistingUUIDDecisions(ctx, table); err != nil {
+		return err
+	}
+	return m.verifyExistingUnsignedDecisions(ctx, table)
+}
+
+// verifyExistingUnsignedDecisions catches BIGINT UNSIGNED type drift on
+// pre-existing target tables: a target created by an earlier run (or another
+// tool) may hold NUMERIC where this run resolved BIGINT, or vice versa,
+// which would surface as a foreign-key failure after the whole copy.
+func (m *Migrator) verifyExistingUnsignedDecisions(ctx context.Context, table string) error {
+	if !m.unsignedCheck.resolved {
+		return nil
+	}
+	prefix := strings.ToLower(table) + "\x00"
+	hasCandidates := false
+	for key := range m.unsignedCheck.demote {
+		if strings.HasPrefix(key, prefix) {
+			hasCandidates = true
+			break
+		}
+	}
+	if !hasCandidates {
+		for key := range m.unsignedCheck.overflowMax {
+			if strings.HasPrefix(key, prefix) {
+				hasCandidates = true
+				break
+			}
+		}
+	}
+	if !hasCandidates {
+		return nil
+	}
+
+	columns, err := m.getMySQLTableStructure(ctx, table)
+	if err != nil {
+		return fmt.Errorf("read source structure for existing table %s: %w", table, err)
+	}
+	metadata, err := m.loadValidationMetadata(ctx, table)
+	if err != nil {
+		return fmt.Errorf("read target structure for existing table %s: %w", table, err)
+	}
+
+	var problems []string
+	for _, col := range columns {
+		if !isUnsignedBigintType(col.Type) || col.CastType != "" {
+			continue
+		}
+		info, exists := metadata.columns[strings.ToLower(col.Name)]
+		if !exists {
+			continue
+		}
+		demote := m.demotedUnsignedBigint(table, col.Name)
+		quotedTarget := fmt.Sprintf("%s.%s", quotePostgresIdentifier(m.schemaName), quotePostgresIdentifier(table))
+		quotedColumn := quotePostgresIdentifier(col.Name)
+		switch {
+		case demote && info.udtName == "numeric":
+			problems = append(problems, fmt.Sprintf(
+				"%s is numeric in the target but this run maps it to bigint (all data verified within the signed range); reconcile with: ALTER TABLE %s ALTER COLUMN %s TYPE bigint USING %s::bigint",
+				col.Name, quotedTarget, quotedColumn, quotedColumn))
+		case !demote && info.udtName == "int8":
+			problems = append(problems, fmt.Sprintf(
+				"%s is bigint in the target but this run keeps it NUMERIC(20) (values exceed the signed 63-bit range); reconcile with: ALTER TABLE %s ALTER COLUMN %s TYPE numeric(20) USING %s::numeric",
+				col.Name, quotedTarget, quotedColumn, quotedColumn))
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf(
+			"existing target table %s.%s was created with different BIGINT UNSIGNED type decisions than this run resolved: %s",
+			m.schemaName, table, strings.Join(problems, "; "))
+	}
+	return nil
 }
 
 // verifyTablesForDataOnly replaces table creation when the run is data-only:

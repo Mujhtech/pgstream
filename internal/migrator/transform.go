@@ -1,8 +1,10 @@
 package migrator
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -137,6 +139,22 @@ func (m *Migrator) transformRows(table string, plans []columnPlan, data [][]any)
 				continue
 			}
 
+			// PostgreSQL text cannot contain NUL (0x00); MySQL strings can.
+			// The byte is unrepresentable on the target, so it is removed —
+			// with a warning — rather than failing the copy. Binary-destined
+			// values (kindBytea) never reach this branch.
+			if plan.kind == kindVerbatimText || plan.kind == kindOther || plan.kind == kindEnum {
+				if containsNullByte(value) {
+					strValue, ok := stringValue(value)
+					if !ok {
+						return fmt.Errorf("column %s.%s has unsupported value type %T", table, plan.name, value)
+					}
+					value = strings.ReplaceAll(strValue, "\x00", "")
+					row[j] = value
+					m.warnNullBytes(table, plan.name)
+				}
+			}
+
 			if plan.kind == kindEnum {
 				strValue, ok := stringValue(value)
 				if !ok {
@@ -173,19 +191,47 @@ func hasZeroDatePrefix(value any) bool {
 	return false
 }
 
+// warnOncePerColumn reports whether this (kind, table, column) has warned
+// before, marking it as warned. It keeps per-row data-quality warnings to
+// one line per column per run.
+func (m *Migrator) warnOncePerColumn(kind, table, column string) bool {
+	key := kind + "\x00" + table + "\x00" + column
+	m.warnOnceMu.Lock()
+	defer m.warnOnceMu.Unlock()
+	if m.warnedOnce == nil {
+		m.warnedOnce = make(map[string]bool)
+	}
+	if m.warnedOnce[key] {
+		return false
+	}
+	m.warnedOnce[key] = true
+	return true
+}
+
 // warnZeroDate logs the NULL conversion once per column per run.
 func (m *Migrator) warnZeroDate(table, column string) {
-	key := table + "\x00" + column
-	m.zeroDateMu.Lock()
-	if m.zeroDateWarned == nil {
-		m.zeroDateWarned = make(map[string]bool)
-	}
-	alreadyWarned := m.zeroDateWarned[key]
-	m.zeroDateWarned[key] = true
-	m.zeroDateMu.Unlock()
-	if !alreadyWarned {
+	if m.warnOncePerColumn("zero-date", table, column) {
 		m.warnf("⚠️  Column %s.%s contains MySQL zero dates ('0000-00-00 ...'); PostgreSQL cannot represent them, so they migrate as NULL. Find the source rows with: SELECT * FROM %s WHERE %s LIKE '0000-00-00%%'", table, column, quoteMySQLIdentifier(table), quoteMySQLIdentifier(column))
 	}
+}
+
+// warnNullBytes logs NUL-byte removal once per column per run.
+func (m *Migrator) warnNullBytes(table, column string) {
+	if m.warnOncePerColumn("nul", table, column) {
+		m.warnf("⚠️  Column %s.%s contains NUL (0x00) bytes, which PostgreSQL text cannot store; they are removed during copy. Find the source rows with: SELECT * FROM %s WHERE INSTR(%s, CHAR(0x00)) > 0", table, column, quoteMySQLIdentifier(table), quoteMySQLIdentifier(column))
+	}
+}
+
+// containsNullByte checks raw driver values for NUL without allocating; the
+// expensive strip happens only on the rare hit.
+func containsNullByte(value any) bool {
+	switch v := value.(type) {
+	case []byte:
+		return bytes.IndexByte(v, 0) >= 0
+	case string:
+		return strings.IndexByte(v, 0) >= 0
+	}
+	return false
 }
 
 // transformValueKind mirrors validateAndTransformValue's semantics with the
@@ -224,6 +270,11 @@ func (m *Migrator) transformValueKind(kind columnKind, dataType string, value an
 	case kindTime, kindOtherTime:
 		if m.isValidTime(strValue) {
 			return strValue, nil
+		}
+		// MySQL TIME is a duration spanning -838:59:59..838:59:59; values
+		// outside PostgreSQL's day-clock range need an INTERVAL column.
+		if isMySQLTimeDuration(strValue) {
+			return nil, fmt.Errorf("time value %q lies outside PostgreSQL's TIME range (MySQL TIME is a duration spanning -838:59:59 to 838:59:59); migrate this column losslessly as a duration with --cast '<table>.<column>=interval'", strValue)
 		}
 		return nil, fmt.Errorf("invalid time value %q", strValue)
 	case kindDate:
@@ -428,6 +479,16 @@ func booleanStringValue(value string) (bool, bool) {
 	default:
 		return false, false
 	}
+}
+
+// mysqlTimeDurationPattern matches MySQL TIME literals, including negative
+// values and hour counts beyond a day's clock (up to 838 hours).
+var mysqlTimeDurationPattern = regexp.MustCompile(`^-?\d{1,3}:\d{1,2}:\d{1,2}(\.\d+)?$`)
+
+// isMySQLTimeDuration reports a well-formed MySQL TIME value; combined with
+// an isValidTime failure it identifies durations PostgreSQL TIME cannot hold.
+func isMySQLTimeDuration(value string) bool {
+	return mysqlTimeDurationPattern.MatchString(value)
 }
 
 func (m *Migrator) isValidTime(value string) bool {
