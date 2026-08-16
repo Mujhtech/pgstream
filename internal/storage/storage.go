@@ -110,7 +110,7 @@ func InitStorage(ctx context.Context, cfg config.Database) (*Storage, error) {
 	// while a migration writes checkpoints, and the busy timeout absorbs
 	// brief cross-process write contention.
 	if cfg.Driver == config.DatabaseDriverSqlite3 && cfg.Options == "" {
-		cfg.Options = "_busy_timeout=5000&_journal_mode=WAL"
+		cfg.Options = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	}
 
 	db, err := database.Connect(ctx, cfg)

@@ -24,7 +24,14 @@ type Database struct {
 
 func Connect(ctx context.Context, cfg config.Database) (*Database, error) {
 
-	db, err := sql.Open(string(cfg.Driver), cfg.BuildDsn())
+	// The pure-Go SQLite driver (modernc.org/sqlite) registers as "sqlite";
+	// the configured driver name stays "sqlite3" for compatibility and for
+	// sqlx's placeholder binding, which knows that name.
+	openDriver := string(cfg.Driver)
+	if cfg.Driver == config.DatabaseDriverSqlite3 {
+		openDriver = "sqlite"
+	}
+	db, err := sql.Open(openDriver, cfg.BuildDsn())
 	if err != nil {
 		return nil, fmt.Errorf("failed to open the db: %w", err)
 	}

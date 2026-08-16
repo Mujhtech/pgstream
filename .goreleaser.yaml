@@ -6,16 +6,18 @@ before:
 builds:
   - main: ./cmd
     env:
-      # NOTE: the default SQLite metadata storage uses mattn/go-sqlite3,
-      # which requires cgo. Binaries built with CGO_ENABLED=0 must use
-      # PostgreSQL metadata storage (DB_DRIVER=postgres) instead.
+      # The default SQLite metadata storage uses the pure-Go
+      # modernc.org/sqlite driver, so cgo-free cross-compiled binaries
+      # keep every feature working.
       - CGO_ENABLED=0
     goos:
       - linux
       - windows
       - darwin
+    ldflags:
+      - -s -w -X github.com/mujhtech/pgstream/cmd/version.Version={{.Version}}
 archives:
-  - format: tar.gz
+  - formats: [tar.gz]
     name_template: >-
       {{ .ProjectName }}_
       {{- title .Os }}_
@@ -25,4 +27,4 @@ archives:
       {{- if .Arm }}v{{ .Arm }}{{ end }}
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]

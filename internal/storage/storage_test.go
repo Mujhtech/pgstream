@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/mujhtech/pgstream/config"
+	_ "modernc.org/sqlite"
 )
 
 func TestStoragePersistsMigrationCursor(t *testing.T) {
@@ -80,7 +80,7 @@ func TestStoragePersistsMigrationCursor(t *testing.T) {
 
 func TestStorageUpgradesLegacyMigrationTable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open legacy database: %v", err)
 	}
