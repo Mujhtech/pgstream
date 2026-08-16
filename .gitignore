@@ -13,3 +13,6 @@ pgstream.db
 # Local database backups (production data — never commit)
 *.gz
 test_db.gz
+
+# Generated manual-work DDL (contains real schema details from your source)
+pgstream-manual-*.sql
