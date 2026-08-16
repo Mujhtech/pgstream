@@ -835,6 +835,13 @@ func (m *Migrator) createAllTables(ctx context.Context, tables []string) error {
 			if err := m.ensurePrimaryKey(ctx, table); err != nil {
 				return fmt.Errorf("failed to ensure primary key for %s: %w", table, err)
 			}
+			// A pre-existing table may carry UUID decisions from an earlier
+			// run that this run's data-driven resolution disagrees with;
+			// surfacing that now costs seconds, discovering it at the
+			// foreign-key stage costs the whole copy.
+			if err := m.verifyExistingUUIDDecisions(ctx, table); err != nil {
+				return err
+			}
 			m.logf("⏭️  Table %s already exists, verified primary key\n", table)
 			continue
 		}

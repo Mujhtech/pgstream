@@ -196,6 +196,14 @@ func (m *Migrator) dryRunTable(ctx context.Context, table string, engine string,
 		return tableReport
 	}
 
+	// A pre-existing target table may disagree with this run's UUID
+	// decisions; that blocks foreign keys later, so the plan flags it now.
+	if exists, err := m.tableExistsInPostgres(ctx, table); err == nil && exists {
+		if err := m.verifyExistingUUIDDecisions(ctx, table); err != nil {
+			tableReport.Issues = append(tableReport.Issues, err.Error())
+		}
+	}
+
 	// One table scan covers the empty-marker check for every enum column.
 	var enumColumnNames []string
 	for _, col := range columns {

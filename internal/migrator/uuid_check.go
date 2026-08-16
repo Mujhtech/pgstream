@@ -408,3 +408,58 @@ func (m *Migrator) resolveUUIDConversions(ctx context.Context, tables []string) 
 	m.uuidCheck.mu.Unlock()
 	return nil
 }
+
+// verifyExistingUUIDDecisions compares a pre-existing target table's
+// uuid/varchar columns against this run's resolved conversion decisions and
+// fails with exact reconciliation DDL when they diverge — before any data
+// copies, instead of at foreign-key creation after it.
+func (m *Migrator) verifyExistingUUIDDecisions(ctx context.Context, table string) error {
+	columns, err := m.getMySQLTableStructure(ctx, table)
+	if err != nil {
+		return fmt.Errorf("read source structure for existing table %s: %w", table, err)
+	}
+	metadata, err := m.loadValidationMetadata(ctx, table)
+	if err != nil {
+		return fmt.Errorf("read target structure for existing table %s: %w", table, err)
+	}
+
+	var problems []string
+	for _, col := range columns {
+		info, exists := metadata.columns[strings.ToLower(col.Name)]
+		if !exists {
+			continue
+		}
+		actualUUID := info.udtName == "uuid"
+		if col.IsUUID == actualUUID {
+			continue
+		}
+		if !col.IsUUID && !isUUIDStorageType(col.Type) {
+			// Not a UUID-shaped column at all; other drift is out of scope.
+			continue
+		}
+
+		quotedTarget := fmt.Sprintf("%s.%s", quotePostgresIdentifier(m.schemaName), quotePostgresIdentifier(table))
+		quotedColumn := quotePostgresIdentifier(col.Name)
+		lowerType := strings.ToLower(col.Type)
+		switch {
+		case actualUUID && (strings.HasPrefix(lowerType, "char(36)") || strings.HasPrefix(lowerType, "varchar(36)")):
+			problems = append(problems, fmt.Sprintf(
+				"%s is uuid in the target but this run keeps it varchar (its key group contains non-UUID data); reconcile with: ALTER TABLE %s ALTER COLUMN %s TYPE varchar(36) USING %s::text",
+				col.Name, quotedTarget, quotedColumn, quotedColumn))
+		case !actualUUID && col.IsUUID:
+			problems = append(problems, fmt.Sprintf(
+				"%s is %s in the target but this run converts it to native uuid (all data verified convertible); reconcile with: ALTER TABLE %s ALTER COLUMN %s TYPE uuid USING %s::uuid",
+				col.Name, info.udtName, quotedTarget, quotedColumn, quotedColumn))
+		default:
+			problems = append(problems, fmt.Sprintf(
+				"%s diverges from this run's decision (target %s, source %s); drop and recreate the table or convert the column manually",
+				col.Name, info.udtName, col.Type))
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf(
+			"existing target table %s.%s was created with different UUID type decisions than this run resolved: %s",
+			m.schemaName, table, strings.Join(problems, "; "))
+	}
+	return nil
+}
