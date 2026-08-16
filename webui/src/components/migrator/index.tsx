@@ -14,6 +14,8 @@ import {
 import { Input } from "@/components/ui/input";
 import { Separator } from "../ui/separator";
 import LogSheet from "./log-sheet";
+import SessionList from "./session-list";
+import { createSession } from "@/lib/api";
 
 const formSchema = z.object({
   mysql: z.object({
@@ -35,6 +37,9 @@ const formSchema = z.object({
 
 export default function Migrator() {
   const [logOpen, setLogOpen] = React.useState(false);
+  const [sessionId, setSessionId] = React.useState<string | null>(null);
+  const [submitting, setSubmitting] = React.useState(false);
+  const [submitError, setSubmitError] = React.useState<string | null>(null);
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -57,8 +62,26 @@ export default function Migrator() {
     },
   });
 
-  function onSubmit() {
-    setLogOpen(true);
+  async function onSubmit(values: z.infer<typeof formSchema>) {
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      const { id } = await createSession({
+        mysql: values.mysql,
+        postgres: {
+          ...values.postgres,
+          schema: values.postgres.schema || undefined,
+        },
+      });
+      setSessionId(id);
+      setLogOpen(true);
+    } catch (error) {
+      setSubmitError(
+        error instanceof Error ? error.message : "failed to start migration",
+      );
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -258,17 +281,37 @@ export default function Migrator() {
                     />
                   </div>
                   <Separator />
-                  <div className="px-3 pb-3 flex justify-end">
-                    <Button type="submit">Review configuration</Button>
+                  <div className="px-3 pb-3 flex items-center justify-end gap-3">
+                    {submitError ? (
+                      <p className="text-sm text-red-500">{submitError}</p>
+                    ) : null}
+                    <Button type="submit" disabled={submitting}>
+                      {submitting ? "Starting..." : "Start migration"}
+                    </Button>
                   </div>
                 </form>
               </Form>
             </div>
             <div className="mt-3 flex flex-col items-center justify-center">
               <p className="text-sm text-muted-foreground">
-                The web runner is preview-only. Use the CLI to perform a
-                migration.
+                Credentials are sent to your local pgstream server, stored
+                encrypted, and never leave your machine.
               </p>
+            </div>
+            <div className="mt-6 w-full max-w-4xl mx-auto rounded-2xl border">
+              <div className="border-b p-3">
+                <h2 className="text-sm font-medium">Sessions</h2>
+                <p className="text-xs text-muted-foreground">
+                  Includes migrations started from the CLI — watch their live
+                  progress here.
+                </p>
+              </div>
+              <SessionList
+                onWatch={(id) => {
+                  setSessionId(id);
+                  setLogOpen(true);
+                }}
+              />
             </div>
           </div>
         </div>
@@ -277,7 +320,7 @@ export default function Migrator() {
           <div className="border-x h-full"></div>
         </div>
       </div>
-      <LogSheet open={logOpen} setOpen={setLogOpen} />
+      <LogSheet open={logOpen} setOpen={setLogOpen} sessionId={sessionId} />
     </>
   );
 }
