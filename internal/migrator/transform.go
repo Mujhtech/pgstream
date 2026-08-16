@@ -3,7 +3,9 @@ package migrator
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -253,4 +255,247 @@ func (m *Migrator) transformValueKind(kind columnKind, dataType string, value an
 	}
 
 	return strValue, nil
+}
+
+// validateAndTransformData validates a batch and converts values in place.
+// The heavy lifting lives in buildColumnPlans/transformRows: the plan
+// resolves all per-column metadata once, so the per-cell loop performs no
+// map lookups, no case folding, and no string-based type dispatch
+// (benchmarked in hotpath_bench_test.go).
+func (m *Migrator) validateAndTransformData(ctx context.Context, table string, columns []string, data [][]any) ([][]any, error) {
+	plans, err := m.buildColumnPlans(ctx, table, columns)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.transformRows(table, plans, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func stringValue(value any) (string, bool) {
+	switch value := value.(type) {
+	case string:
+		return value, true
+	case []byte:
+		return string(value), true
+	default:
+		return "", false
+	}
+}
+
+func (m *Migrator) validateAndTransformValue(value any, dataType string) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+
+	if dataType == "bytea" {
+		return value, nil
+	}
+	if dataType == "uuid" {
+		if bytes, ok := value.([]byte); ok && len(bytes) == 16 {
+			if parsed, err := uuid.FromBytes(bytes); err == nil {
+				return parsed.String(), nil
+			}
+		}
+	}
+	if dataType == "boolean" {
+		if booleanValue, ok := booleanValue(value); ok {
+			return booleanValue, nil
+		}
+		return nil, fmt.Errorf("invalid boolean value %v", value)
+	}
+
+	strValue, ok := stringValue(value)
+	if !ok {
+		return value, nil
+	}
+
+	// Text is copied exactly. Whitespace can be meaningful data.
+	if dataType == "text" || strings.Contains(dataType, "character") || dataType == "json" || dataType == "jsonb" {
+		return strValue, nil
+	}
+
+	strValue = strings.TrimSpace(strValue)
+	if strValue == "" {
+		return nil, fmt.Errorf("empty value cannot be represented as %s", dataType)
+	}
+
+	switch dataType {
+	case "time", "time without time zone", "time with time zone":
+		if m.isValidTime(strValue) {
+			return strValue, nil
+		}
+		return nil, fmt.Errorf("invalid time value %q", strValue)
+	case "date":
+		if m.isValidDate(strValue) {
+			return strValue, nil
+		}
+		return nil, fmt.Errorf("invalid date value %q", strValue)
+	case "timestamp", "timestamp without time zone", "timestamp with time zone":
+		if m.isValidTimestamp(strValue) {
+			return strValue, nil
+		}
+		return nil, fmt.Errorf("invalid timestamp value %q", strValue)
+	case "integer", "bigint", "smallint":
+		if m.isValidInteger(strValue) {
+			return strValue, nil
+		}
+		return nil, fmt.Errorf("invalid integer value %q", strValue)
+	case "numeric", "decimal", "real", "double precision":
+		if m.isValidNumeric(strValue) {
+			return strValue, nil
+		}
+		return nil, fmt.Errorf("invalid numeric value %q", strValue)
+	case "boolean":
+		if parsed, ok := booleanStringValue(strValue); ok {
+			return parsed, nil
+		}
+		return nil, fmt.Errorf("invalid boolean value %q", strValue)
+	case "uuid":
+		parsed, err := uuid.Parse(strValue)
+		if err != nil {
+			return nil, fmt.Errorf("invalid UUID value %q: %w", strValue, err)
+		}
+		return parsed.String(), nil
+	default:
+		if strings.Contains(strings.ToLower(dataType), "time") {
+			if !m.isValidTime(strValue) {
+				return nil, fmt.Errorf("invalid time value %q for type %s", strValue, dataType)
+			}
+		}
+	}
+
+	return strValue, nil
+}
+
+func booleanValue(value any) (bool, bool) {
+	switch value := value.(type) {
+	case bool:
+		return value, true
+	case int:
+		return numericBoolean(int64(value))
+	case int8:
+		return numericBoolean(int64(value))
+	case int16:
+		return numericBoolean(int64(value))
+	case int32:
+		return numericBoolean(int64(value))
+	case int64:
+		return numericBoolean(value)
+	case uint:
+		return unsignedBoolean(uint64(value))
+	case uint8:
+		return unsignedBoolean(uint64(value))
+	case uint16:
+		return unsignedBoolean(uint64(value))
+	case uint32:
+		return unsignedBoolean(uint64(value))
+	case uint64:
+		return unsignedBoolean(value)
+	case []byte:
+		if len(value) == 1 && (value[0] == 0 || value[0] == 1) {
+			return value[0] == 1, true
+		}
+		return booleanStringValue(string(value))
+	case string:
+		return booleanStringValue(value)
+	default:
+		return false, false
+	}
+}
+
+func numericBoolean(value int64) (bool, bool) {
+	if value == 0 || value == 1 {
+		return value == 1, true
+	}
+	return false, false
+}
+
+func unsignedBoolean(value uint64) (bool, bool) {
+	if value == 0 || value == 1 {
+		return value == 1, true
+	}
+	return false, false
+}
+
+func booleanStringValue(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "t", "y":
+		return true, true
+	case "false", "0", "no", "f", "n":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func (m *Migrator) isValidTime(value string) bool {
+	timeFormats := []string{
+		"15:04:05",
+		"15:04",
+	}
+
+	for _, format := range timeFormats {
+		if _, err := time.Parse(format, value); err == nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (m *Migrator) isValidDate(value string) bool {
+	_, err := time.Parse("2006-01-02", value)
+	return err == nil
+}
+
+func (m *Migrator) isValidTimestamp(value string) bool {
+	// Check if it's a valid timestamp format
+	timestampFormats := []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
+	}
+
+	for _, format := range timestampFormats {
+		if _, err := time.Parse(format, value); err == nil {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (m *Migrator) isValidInteger(value string) bool {
+	// Remove any leading/trailing whitespace
+	value = strings.TrimSpace(value)
+
+	// Check if it's a valid integer
+	if value == "" {
+		return false
+	}
+
+	// Check for valid integer patterns
+	if _, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return true
+	}
+
+	return false
+}
+
+func (m *Migrator) isValidNumeric(value string) bool {
+	// Remove any leading/trailing whitespace
+	value = strings.TrimSpace(value)
+
+	// Check if it's a valid numeric
+	if value == "" {
+		return false
+	}
+
+	// Check for valid numeric patterns
+	if _, err := strconv.ParseFloat(value, 64); err == nil {
+		return true
+	}
+
+	return false
 }

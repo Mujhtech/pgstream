@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/jmoiron/sqlx"
+	"golang.org/x/sync/errgroup"
 )
 
 // IndexInfo represents a database index
@@ -850,4 +851,123 @@ func (sm *SchemaMigrator) tableExistsInPostgres(ctx context.Context, tableName s
 	}
 
 	return exists, nil
+}
+
+// migrateAllSchemaObjects migrates all schema objects (indexes, foreign keys, triggers, functions, views)
+func (m *Migrator) migrateAllSchemaObjects(ctx context.Context, tables []string) error {
+	m.logf("🔧 Migrating indexes and foreign keys for all tables...")
+	var migrationErrors []error
+
+	var errMu sync.Mutex
+	collect := func(err error) {
+		m.warnf("⚠️  %v\n", err)
+		errMu.Lock()
+		migrationErrors = append(migrationErrors, err)
+		errMu.Unlock()
+	}
+
+	// Index creation dominates this phase and is safe to parallelize across
+	// distinct tables, unlike foreign keys (concurrent ALTER TABLE on shared
+	// referenced tables can deadlock). Errors are collected, not fail-fast,
+	// matching the sequential behavior.
+	indexGroup := &errgroup.Group{}
+	indexGroup.SetLimit(max(m.workers, 1))
+	for _, table := range tables {
+		indexGroup.Go(func() error {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err := m.schemaMigrator.migrateIndexes(ctx, table); err != nil {
+				collect(fmt.Errorf("failed to migrate indexes for %s: %w", table, err))
+			}
+			if err := m.schemaMigrator.migrateTriggers(ctx, table); err != nil {
+				collect(fmt.Errorf("failed to migrate triggers for %s: %w", table, err))
+			}
+			if err := m.schemaMigrator.reportAutoUpdateTimestampColumns(ctx, table); err != nil {
+				collect(fmt.Errorf("failed to inspect auto-update timestamp columns for %s: %w", table, err))
+			}
+			if err := m.reportGeneratedColumns(ctx, table); err != nil {
+				collect(fmt.Errorf("failed to inspect generated columns for %s: %w", table, err))
+			}
+			return nil
+		})
+	}
+	_ = indexGroup.Wait()
+
+	// Foreign keys run sequentially: two concurrent ALTER TABLE ... ADD
+	// CONSTRAINT statements referencing the same table can deadlock in
+	// PostgreSQL.
+	for _, table := range tables {
+		if err := m.schemaMigrator.migrateForeignKeys(ctx, table); err != nil {
+			collect(fmt.Errorf("failed to migrate foreign keys for %s: %w", table, err))
+		}
+	}
+
+	// Migrate global objects (functions, views)
+	m.logf("🔧 Migrating global schema objects (functions, views)...")
+	if err := m.schemaMigrator.MigrateAllFunctions(ctx); err != nil {
+		m.warnf("⚠️  Failed to migrate functions: %v\n", err)
+		migrationErrors = append(migrationErrors, err)
+	}
+
+	if err := m.schemaMigrator.MigrateAllViews(ctx); err != nil {
+		m.warnf("⚠️  Failed to migrate views: %v\n", err)
+		migrationErrors = append(migrationErrors, err)
+	}
+
+	return errors.Join(migrationErrors...)
+}
+
+// reportGeneratedColumns emits manual-work DDL for MySQL generated columns.
+// The migrated column is a plain column holding the computed snapshot
+// values; restoring auto-computation requires translating the MySQL
+// expression, so the template deliberately fails to parse until edited.
+func (m *Migrator) reportGeneratedColumns(ctx context.Context, table string) error {
+	columns, err := m.getMySQLTableStructure(ctx, table)
+	if err != nil {
+		return err
+	}
+	for _, col := range columns {
+		if !isGeneratedColumn(col.Extra) {
+			continue
+		}
+		pgType, err := m.convertMySQLTypeToPostgres(col.Type, col.Name, table)
+		if err != nil {
+			pgType = "/* TODO: choose type */"
+		}
+		if col.IsUUID {
+			pgType = "UUID"
+		}
+
+		storage := "STORED"
+		if strings.Contains(strings.ToLower(col.Extra), "virtual") {
+			storage = "VIRTUAL"
+		}
+		m.warnf("⚠️  Column %s.%s is a MySQL %s generated column; it was migrated as a plain column holding the computed snapshot values. Translate its expression manually to restore auto-computation.", table, col.Name, storage)
+
+		quotedSchema := quotePostgresIdentifier(m.schemaName)
+		quotedTable := quotePostgresIdentifier(table)
+		quotedColumn := quotePostgresIdentifier(col.Name)
+		notNull := ""
+		if !col.Nullable {
+			notNull = " NOT NULL"
+		}
+		sql := fmt.Sprintf(`ALTER TABLE %s.%s DROP COLUMN %s;
+ALTER TABLE %s.%s ADD COLUMN %s %s GENERATED ALWAYS AS (/* TODO translate from MySQL: %s */) STORED%s`,
+			quotedSchema, quotedTable, quotedColumn,
+			quotedSchema, quotedTable, quotedColumn, pgType,
+			strings.ReplaceAll(col.GenerationExpression, "*/", "* /"), notNull,
+		)
+		m.schemaMigrator.appendManual(ManualStatement{
+			Kind:  "generated_column",
+			Table: table,
+			Name:  col.Name,
+			SQL:   sql,
+			Reason: fmt.Sprintf(
+				"MySQL computes %s.%s as a %s generated column (%s); the expression cannot be translated automatically. The migrated column holds the snapshot values; edit the expression below, then run to restore auto-computation. PostgreSQL only supports STORED generation.",
+				table, col.Name, storage, col.GenerationExpression,
+			),
+		})
+	}
+	return nil
 }
