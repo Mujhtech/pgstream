@@ -1,8 +1,8 @@
 # PGStream
 
-PGStream is an early-stage MySQL-to-PostgreSQL migration CLI focused on databases that are too large to load into memory.
+PGStream migrates large MySQL databases to PostgreSQL — COPY loading from consistent snapshots, resumable checkpoints, data-driven type conversion, dry-run planning, and a live web UI. It streams tables in bounded memory, so database size is not limited by RAM, and it has been hardened against a real 83-table production database that it migrates end to end in about ten minutes (see [BENCHMARKS.md](BENCHMARKS.md)).
 
-The current milestone provides a resumable, bounded-memory copy path. It is still alpha software: test it against a disposable PostgreSQL database and validate the result before a production cutover.
+As with any migration tool: run `--dry-run` first, and validate the result against the source before a production cutover.
 
 ## Quick start
 
