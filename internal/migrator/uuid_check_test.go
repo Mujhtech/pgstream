@@ -68,3 +68,20 @@ func TestFormatDurationScales(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatRowProgress(t *testing.T) {
+	if got := formatRowProgress(500, 1000, true); got != "500/1000 rows" {
+		t.Fatalf("exact progress: %q", got)
+	}
+	if got := formatRowProgress(500, 1000, false); got != "500/~1000 rows" {
+		t.Fatalf("estimated progress: %q", got)
+	}
+	// An exceeded estimate proves itself wrong and is dropped rather than
+	// showing more than 100%.
+	if got := formatRowProgress(2077845, 1523815, false); got != "2077845 rows" {
+		t.Fatalf("exceeded estimate must drop the denominator: %q", got)
+	}
+	if got := formatRowProgress(42, 0, true); got != "42 rows" {
+		t.Fatalf("zero total: %q", got)
+	}
+}

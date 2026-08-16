@@ -298,6 +298,20 @@ func (m *Migrator) Start(ctx context.Context) error {
 	return nil
 }
 
+// formatRowProgress renders copy progress. Exact totals come from a
+// snapshot COUNT(*) and can never be exceeded; the statistics-estimate
+// fallback is marked with '~' and dropped entirely once it proves wrong.
+func formatRowProgress(processed, total int64, exact bool) string {
+	switch {
+	case total <= 0 || (!exact && processed > total):
+		return fmt.Sprintf("%d rows", processed)
+	case exact:
+		return fmt.Sprintf("%d/%d rows", processed, total)
+	default:
+		return fmt.Sprintf("%d/~%d rows", processed, total)
+	}
+}
+
 // formatDuration renders run timings at a human scale: milliseconds under a
 // second, tenths of a second under a minute, whole seconds beyond.
 func formatDuration(duration time.Duration) string {
@@ -479,20 +493,34 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 		return fmt.Errorf("failed to map columns for table %s: %w", table, err)
 	}
 
-	// InnoDB COUNT(*) scans the whole table. Use its metadata estimate for progress
-	// and let the keyset loop determine when the copy is complete.
-	var estimatedRowCount sql.NullInt64
-	row := m.sourceQueryer(ctx).QueryRowContext(ctx, `
-		SELECT TABLE_ROWS
-		FROM INFORMATION_SCHEMA.TABLES
-		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
-	`, table)
-	if err := row.Scan(&estimatedRowCount); err != nil {
-		return fmt.Errorf("estimate rows in %s: %w", table, err)
+	// COUNT(*) on the snapshot connection is exact for precisely the rows
+	// this copy will read (same snapshot), scans only the clustered index
+	// server-side, and costs a few seconds even on multi-million-row tables
+	// — a fair price for progress that cannot exceed 100%. InnoDB's
+	// TABLE_ROWS statistics estimate (often off by 30-50%) is only the
+	// fallback when counting fails.
+	var rowCount int64
+	exactCount := true
+	if err := m.sourceQueryer(ctx).QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", quoteMySQLIdentifier(table))).Scan(&rowCount); err != nil {
+		exactCount = false
+		var estimatedRowCount sql.NullInt64
+		row := m.sourceQueryer(ctx).QueryRowContext(ctx, `
+			SELECT TABLE_ROWS
+			FROM INFORMATION_SCHEMA.TABLES
+			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+		`, table)
+		if err := row.Scan(&estimatedRowCount); err != nil {
+			return fmt.Errorf("estimate rows in %s: %w", table, err)
+		}
+		rowCount = estimatedRowCount.Int64
+		m.warnf("⚠️  Could not count rows in %s exactly; progress totals for this table are the ~%d statistics estimate", table, rowCount)
 	}
-	rowCount := estimatedRowCount.Int64
 
-	m.progress(table, 0, rowCount, "📦 Migrating table %s (approximately %d rows)...", table, rowCount)
+	if exactCount {
+		m.progress(table, 0, rowCount, "📦 Migrating table %s (%d rows)...", table, rowCount)
+	} else {
+		m.progress(table, 0, rowCount, "📦 Migrating table %s (approximately %d rows)...", table, rowCount)
+	}
 
 	// Get current migration state to resume from last offset
 	state, err := m.storage.GetMigration(ctx, m.sessionId, table)
@@ -526,7 +554,7 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 			return fmt.Errorf("table %s has no primary key and cannot be resumed safely after %d rows; start a fresh session against an empty target", table, processedRows)
 		}
 		m.warnf("⚠️  Table %s has no primary key; using one streaming source scan with bounded insert batches. This table cannot be resumed after interruption.\n", table)
-		if err := m.migrateKeylessTable(ctx, table, mysqlColumns, mappedColumns, rowCount, batchSize); err != nil {
+		if err := m.migrateKeylessTable(ctx, table, mysqlColumns, mappedColumns, rowCount, exactCount, batchSize); err != nil {
 			return err
 		}
 		if err := m.syncIdentitySequences(ctx, table); err != nil {
@@ -679,11 +707,7 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 			}
 			checkpointTime += time.Since(checkpointStart)
 
-			progress := fmt.Sprintf("%d rows", processedRows)
-			if rowCount > 0 {
-				progress = fmt.Sprintf("%d/~%d rows", processedRows, rowCount)
-			}
-			m.progress(table, processedRows, rowCount, "✅ Inserted %d rows into %s (progress: %s)", len(batch.values), table, progress)
+			m.progress(table, processedRows, rowCount, "✅ Inserted %d rows into %s (progress: %s)", len(batch.values), table, formatRowProgress(processedRows, rowCount, exactCount))
 		}
 		return nil
 	})
@@ -708,7 +732,7 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 	return nil
 }
 
-func (m *Migrator) migrateKeylessTable(ctx context.Context, table string, mysqlColumns, mappedColumns []string, rowCount int64, batchSize int) error {
+func (m *Migrator) migrateKeylessTable(ctx context.Context, table string, mysqlColumns, mappedColumns []string, rowCount int64, exactCount bool, batchSize int) error {
 	// Keyless copies cannot deduplicate, so the target must start empty.
 	targetRows, err := m.targetTableRowCount(ctx, table)
 	if err != nil {
@@ -757,11 +781,7 @@ func (m *Migrator) migrateKeylessTable(ctx context.Context, table string, mysqlC
 		}); err != nil {
 			return fmt.Errorf("checkpoint keyless migration for %s: %w", table, err)
 		}
-		progress := fmt.Sprintf("%d rows", processedRows)
-		if rowCount > 0 {
-			progress = fmt.Sprintf("%d/~%d rows", processedRows, rowCount)
-		}
-		m.progress(table, processedRows, rowCount, "✅ Inserted %d rows into %s (progress: %s)", len(batch), table, progress)
+		m.progress(table, processedRows, rowCount, "✅ Inserted %d rows into %s (progress: %s)", len(batch), table, formatRowProgress(processedRows, rowCount, exactCount))
 		batch = batch[:0]
 		return nil
 	}
