@@ -4,32 +4,16 @@ PGStream is an early-stage MySQL-to-PostgreSQL migration CLI focused on database
 
 The current milestone provides a resumable, bounded-memory copy path. It is still alpha software: test it against a disposable PostgreSQL database and validate the result before a production cutover.
 
-## What works today
+## Quick start
 
-- Interactive MySQL and PostgreSQL connection setup
-- PostgreSQL schema and table creation with common MySQL type mappings
-- Fail-closed errors for unknown types and generated/default behavior that cannot be preserved safely
-- MySQL `ENUM` creation in PostgreSQL
-- Primary-key preservation, including composite primary keys
-- Primary-key keyset pagination for large tables
-- Persistent typed cursors and row progress for interrupted migrations
-- A read-only MySQL `REPEATABLE READ` snapshot for each copy invocation
-- Transactional multi-row PostgreSQL inserts, bounded by PostgreSQL's parameter limit
-- Idempotent replay of primary-keyed batches with conflict-targeted upserts and row-count checks
-- PostgreSQL identity/serial synchronization that preserves MySQL's next `AUTO_INCREMENT` value
-- Secondary, unique, and composite index migration after data loading
-- Single- and composite-column foreign keys after data loading
-- Authenticated encryption for resumable connection credentials
-- SQLite metadata storage by default, with PostgreSQL metadata storage support
-- View discovery and explicit manual-conversion reporting
+```bash
+export ENCRYPTION_KEY="$(openssl rand -base64 32)"
+make webui              # build the web UI once so it can be embedded (requires bun)
+go build -o pgstream ./cmd
 
-PGStream deliberately skips views, stored functions, and triggers for now. Translating MySQL SQL with string replacement can silently change application behavior, so the CLI reports those objects instead of installing unsafe placeholders.
-
-The same fail-closed rule applies to unsupported column types, generated columns, `ON UPDATE` behavior, and default expressions: PGStream stops with an actionable error instead of silently substituting a different schema.
-
-Tables without a primary key use one streaming source query with bounded PostgreSQL insert batches, avoiding unsafe `OFFSET` boundaries. They still cannot be resumed safely after interruption. Add a stable primary key before migration or truncate the partial target and start a fresh session.
-
-## Build and run
+./pgstream session --dry-run     # preview the full translation plan, writes nothing
+./pgstream session               # run the migration (interactive connection setup)
+```
 
 Requirements:
 
@@ -37,38 +21,150 @@ Requirements:
 - Network access from the CLI to the source MySQL and target PostgreSQL servers
 - InnoDB source tables (non-transactional MySQL engines cannot provide the required consistent snapshot)
 - A PostgreSQL role allowed to create the target schema and its objects
-- A persistent 32-byte credential-encryption key (raw, base64, or 64-character hex)
+- A persistent 32-byte credential-encryption key (raw, base64, or 64-character hex) in `ENCRYPTION_KEY`
+
+## CLI usage
+
+| Command | Purpose |
+| --- | --- |
+| `pgstream session` | Run or resume a migration (interactive connection setup on first run) |
+| `pgstream status` | Show progress of sessions from the session store, live |
+| `pgstream serve` | Start the local HTTP server with the JSON API and bundled web UI |
+| `pgstream version` | Print the build version |
+
+### `pgstream session`
+
+Starts a migration. Without `--id` it prompts interactively for the MySQL and PostgreSQL connection details, stores them encrypted, prints a new session ID, and begins a fresh migration. A fresh session refuses to copy into target tables that already contain rows.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--id <session-id>` | — | Resume an existing session from its last committed checkpoint |
+| `--batch-size <n>` | `5000` | Rows read from MySQL per batch |
+| `--include-tables a,b` | — | Migrate only the listed tables |
+| `--exclude-tables a,b` | — | Migrate everything except the listed tables |
+| `--dry-run` | off | Print the full translation plan and exit; writes nothing |
+| `--load-method copy\|insert` | `copy` | How batches are written to PostgreSQL |
+| `--workers <n>` | `1` | Tables migrated concurrently (max 16) |
+| `--skip-snapshot-lock` | off | Skip the multi-worker snapshot alignment lock (see below) |
+
+Notes on each:
+
+- **`--dry-run`** connects to both databases and prints every planned table, column type mapping, enum, index, and foreign key, plus warnings (generated columns, `ON UPDATE CURRENT_TIMESTAMP`, invalid-enum markers in the data, dangling foreign keys) and blocking issues. It exits non-zero when the plan has blocking issues, so it works as a CI/pre-flight gate. Without `--id` it needs neither `ENCRYPTION_KEY` nor session storage.
+- **`--include-tables` / `--exclude-tables`** are mutually exclusive and fail closed: unknown table names error, and a selection whose foreign keys point outside the selection errors before anything is written.
+- **`--load-method copy`** (default) streams batches through the PostgreSQL COPY protocol; the first batch after a resume still uses conflict-targeted inserts so replayed rows stay idempotent. `insert` keeps multi-row INSERTs. On a real 1.6M-row production backup, COPY cut end-to-end migration time by 1.84× and doubled large-table throughput — see [BENCHMARKS.md](BENCHMARKS.md).
+- **`--id`** resumes primary-keyed tables from their last committed batch. Keyless tables cannot resume; truncate their partial target and re-run. Resuming is also how skipped foreign keys are retried after missing source tables are restored.
+- **`--workers N`** copies up to N tables concurrently, each on its own MySQL connection with a consistent snapshot, all observing the same point in time. Alignment tries two strategies automatically: a brief `FLUSH TABLES WITH READ LOCK` (milliseconds; needs the `RELOAD` privilege), then — when that is unavailable, as on RDS and most managed MySQL — **lock-free verified alignment**: the binlog position is captured before and after opening the snapshots, and identical positions prove no transaction committed in between (needs `REPLICATION CLIENT`, retried a few times on a busy source). If neither works, pass `--skip-snapshot-lock` to assert the source receives no writes, or run with `--workers 1`. Index creation also parallelizes across tables; foreign keys stay sequential to avoid PostgreSQL lock conflicts. Independent of worker count, every table copy pipelines its MySQL reads with its PostgreSQL writes, so even `--workers 1` is faster than earlier releases. Because workers copy whole tables, wall time can never drop below your largest table's copy time: raise `--workers` when the schema has several similarly sized tables, and leave it at 1 when one table holds most of the data (see [BENCHMARKS.md](BENCHMARKS.md)).
+
+Interrupting a run with Ctrl+C is safe: the migration stops after the current batch, progress stays checkpointed, the interruption is recorded in the session log, and the CLI prints the exact resume command. A second Ctrl+C terminates immediately.
+
+Typical workflow:
 
 ```bash
-export ENCRYPTION_KEY="$(openssl rand -base64 32)"
-go build -o pgstream ./cmd
-./pgstream session --batch-size 5000
+./pgstream session --dry-run                          # 1. preview and fix reported issues
+./pgstream session --batch-size 5000                  # 2. migrate; note the printed session ID
+./pgstream status --id <session-id>                   # 3. watch from another terminal
+./pgstream session --id <session-id>                  # 4. resume if interrupted
 ```
 
-Store `ENCRYPTION_KEY` in a secret manager or a private `.env` file and keep it unchanged for the lifetime of resumable sessions. Losing or changing it makes encrypted session credentials unreadable.
+Every run may also produce `pgstream-manual-<session-id>.sql` in the working directory: DDL that pgstream deliberately did not execute (foreign keys whose referenced table is missing from the source, `ON UPDATE CURRENT_TIMESTAMP` trigger equivalents, generated-column templates awaiting expression translation), each with the reason. Review and apply it after resolving each blocker.
 
-The CLI prints a new session ID for every invocation without `--id`. A fresh session refuses to copy into target tables that already contain rows. If the process is interrupted or a table fails, resume the same primary-keyed migration from its last committed batch:
+### `pgstream status`
+
+Reads the session store only — no database credentials or `ENCRYPTION_KEY` needed.
 
 ```bash
-./pgstream session --id <session-id> --batch-size 5000
+./pgstream status                  # list sessions: status, tables done, rows copied
+./pgstream status --id <session>   # per-table progress plus the recent engine log
 ```
 
-Session metadata is stored in `pgstream.db` by default and the CLI restricts that file to owner read/write permissions. It can be moved to PostgreSQL through the `DB_DRIVER`, `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, and `DB_DATABASE` environment variables.
+Progress checkpoints and the engine log update after every committed batch, so this observes a migration currently running in another terminal or in the server.
 
-The source and target credentials required for resume are stored with authenticated encryption. Existing valid plaintext session records are encrypted the first time they are resumed. Keep both the metadata database and encryption key private, and delete stale session records when they are no longer needed.
+### `pgstream serve`
 
-Each invocation reads rows from one consistent source snapshot. For an interrupted migration resumed in a later process, keep the source quiescent until cutover: a new invocation necessarily opens a new snapshot and cannot account for changes made between snapshots without CDC/binlog tailing.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--addr` | `127.0.0.1:8080` | Listen address |
+| `--config` | `.env` | Configuration file loaded before environment variables |
 
-For a large source, the long-running snapshot can retain InnoDB undo history. Monitor source purge/undo pressure during the copy, avoid concurrent schema changes, and rehearse the operational window before production cutover.
+Serves the bundled web UI and the JSON API (see [Server and web UI](#server-and-web-ui)). Binds to localhost by default because migration requests carry database credentials.
+
+## Configuration
+
+`pgstream session`, `status`, and `serve` load `.env` from the working directory (or `--config` for `serve`), then read environment variables:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ENCRYPTION_KEY` | — (required to migrate) | 32-byte key protecting stored session credentials |
+| `DB_DRIVER` | `sqlite3` | Session-store driver: `sqlite3` or `postgres` |
+| `DB_PATH` | `pgstream.db` | SQLite session-store path |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_DATABASE` | — | PostgreSQL session store (when `DB_DRIVER=postgres`) |
+| `PORT` | — | Overrides the serve port when `--addr` is not given |
+| `LOG_LEVEL` | `info` | `debug` or `trace` for verbose server logging |
+
+The session store holds session records, per-table checkpoints, and the persisted engine log. **The CLI and server must share the same store to see each other's sessions** — run both from the same directory or point both at it via `DB_PATH` (or the `DB_*` variables). The SQLite file is restricted to owner read/write.
+
+Store `ENCRYPTION_KEY` in a secret manager or a private `.env` file and keep it unchanged for the lifetime of resumable sessions — losing or changing it makes encrypted session credentials unreadable. Legacy plaintext session records are encrypted the first time they are resumed. Delete stale session records when no longer needed.
+
+## What works today
+
+- Interactive MySQL and PostgreSQL connection setup with encrypted, resumable credentials
+- PostgreSQL schema and table creation with common MySQL type mappings; MySQL `ENUM` creation
+- Primary-key preservation (including composite keys) and keyset pagination for large tables
+- Persistent typed cursors and per-batch checkpoints for interrupted migrations
+- A read-only MySQL `REPEATABLE READ` snapshot per copy invocation
+- PostgreSQL `COPY` bulk loading with idempotent, conflict-targeted replay after resume
+- Identity/serial synchronization preserving MySQL's next `AUTO_INCREMENT` value
+- Secondary/unique/composite index and single/composite foreign-key migration after data load
+- Table selection, dry-run planning, SQLite or PostgreSQL session storage
+- A local HTTP server with a JSON API, live log streaming, and a bundled web UI
+
+## How tricky schemas are handled
+
+The guiding rule is fail-closed: stop with an actionable error instead of silently substituting a different schema. Where a lossless path exists, pgstream takes it and reports the rest as reviewed manual work:
+
+- **Views, stored functions, triggers** are discovered and reported for manual conversion; translating MySQL SQL by string replacement can silently change behavior, so nothing unsafe is installed.
+- **Dangling foreign keys** (referenced table missing from the source — partial or truncated backups) are skipped with their exact `ALTER TABLE` DDL saved to the manual-work file; re-running the session after restoring the missing tables retries them automatically. If a staged migration split column types (`VARCHAR(36)` vs `UUID`), the error includes the exact `ALTER COLUMN ... TYPE uuid USING` statement to reconcile them.
+- **`ON UPDATE CURRENT_TIMESTAMP`** columns migrate normally; the auto-update behavior becomes generated trigger DDL (faithful to MySQL: refresh only when the column was not set explicitly) in the manual-work file.
+- **Generated columns** (VIRTUAL and STORED) migrate as plain columns holding the values MySQL had computed at snapshot time; the manual-work file contains a `GENERATED ALWAYS AS (...) STORED` template with the original MySQL expression, deliberately unrunnable until translated.
+- **Invalid-enum markers**: rows storing MySQL's empty-string marker (invalid values inserted outside strict SQL mode) are detected in the data, counted, and preserved by adding `''` to the PostgreSQL enum type, with a warning telling you how to find and clean them.
+- **MySQL zero dates** (`0000-00-00 00:00:00`, allowed by pre-strict SQL modes) have no PostgreSQL representation. They migrate as `NULL` when the target column is nullable (with a warning and an inspect query); a `NOT NULL` target fails closed with remediation guidance. `--dry-run` counts them per column up front, reporting nullable columns as warnings and `NOT NULL` columns as blocking issues.
+- **UUID conversion is decided by the data, not just the shape.** `char(36)`/`varchar(36)` keys usually hold UUIDs, but not always (application-defined string keys are common). Before converting, pgstream scans the candidate column in one pass; any non-UUID value keeps the original `VARCHAR` type (lossless) with a warning and an inspect query. Foreign-key columns follow their referenced column's decision so constraint types stay compatible. `--dry-run` reports every demotion before anything is created.
+- **Keyless tables** are copied in one streaming pass with bounded insert batches (no unsafe `OFFSET`), but cannot resume after interruption — add a stable primary key or truncate the partial target and re-run.
+- Unknown column types and expression defaults still stop the migration with an actionable error.
 
 ## Migration order
 
 1. Create the target schema, tables, enum types, and primary keys.
 2. Copy table data in batches and checkpoint every committed batch.
 3. Create secondary indexes and foreign keys.
-4. Report views, triggers, and stored functions that require manual conversion.
+4. Report views, triggers, stored functions, and other manual work.
 
 Loading data before secondary indexes, foreign keys, and triggers improves throughput and prevents target-side behavior from changing copied rows.
+
+## Operational notes
+
+Each invocation reads rows from one consistent source snapshot. For an interrupted migration resumed in a later process, keep the source quiescent until cutover: a new invocation necessarily opens a new snapshot and cannot account for changes made between snapshots without CDC/binlog tailing.
+
+For a large source, the long-running snapshot can retain InnoDB undo history. Monitor source purge/undo pressure during the copy, avoid concurrent schema changes, and rehearse the operational window before production cutover.
+
+## Server and web UI
+
+```bash
+export ENCRYPTION_KEY="$(openssl rand -base64 32)"
+make webui build
+./pgstream serve            # http://127.0.0.1:8080
+```
+
+`pgstream serve` starts a local HTTP server that serves the bundled web UI and a JSON API:
+
+- `GET /api/sessions` — list all sessions with aggregate progress, including CLI-driven ones
+- `POST /api/sessions` — create a session and start a fresh migration
+- `POST /api/sessions/{id}/start` — resume an interrupted session
+- `GET /api/sessions/{id}` — run status plus per-table progress records
+- `GET /api/sessions/{id}/events` — Server-Sent Events stream of live logs and progress (supports `Last-Event-ID` replay); for sessions running in another process (e.g. the CLI) it tails the persisted engine log from the session store
+- `POST /api/dry-run` — full schema translation plan without writing anything
+
+The web UI's session list shows every session with live progress — including CLI-driven migrations — and streams their complete engine log. The server binds to `127.0.0.1` by default because migration requests carry database credentials; put an authenticating reverse proxy in front of it before exposing it further. For web UI development, `npm run dev` in `webui/` proxies `/api` to the local server.
 
 ## Verify the repository
 
@@ -82,16 +178,12 @@ npm run lint
 npm run build
 ```
 
-The web UI currently builds but is not connected to the migration engine.
-
 ## Near-term roadmap
 
 - End-to-end MySQL/PostgreSQL integration tests with generated large datasets
 - Whole-database snapshot/cutover coordination and checksum verification
-- Explicit include/exclude table selection and dry-run schema reports
-- Faster PostgreSQL `COPY`-based loading
 - Safe handling and reporting for every unsupported MySQL type or default
-- A server API and live progress stream for the web UI
 - Cutover support for ongoing writes (CDC/binlog tailing)
+- A pure-Go SQLite driver so release binaries can keep `CGO_ENABLED=0` with the default metadata storage
 
 The older feature inventory is retained in [MIGRATION_FEATURES.md](MIGRATION_FEATURES.md) as a product target, not a claim that every item is complete.
