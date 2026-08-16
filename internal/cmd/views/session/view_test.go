@@ -37,13 +37,40 @@ func TestFinalEnterRequiresAllInputsAndMarksSubmission(t *testing.T) {
 	m.inputs[postgresDatabase].SetValue("target")
 	m.focused = postgresSchema
 
-	updated, command := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	// Enter on the last field advances to the Continue button; enter on the
+	// button validates everything and submits.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	got := updated.(model)
+	if got.focused != buttonIndex || got.submitted {
+		t.Fatalf("expected focus on the Continue button before submission: %#v", got)
+	}
+
+	updated, command := got.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got = updated.(model)
 	if !got.submitted || got.cancelled || got.err != nil {
 		t.Fatalf("expected valid submission: %#v", got)
 	}
 	if command == nil {
 		t.Fatal("expected submission to quit the program")
+	}
+}
+
+func TestContinueButtonJumpsToFirstInvalidInput(t *testing.T) {
+	m := initialModel()
+	// mysqlDatabase left empty: submission must bounce focus back to it.
+	m.inputs[postgresDatabase].SetValue("target")
+	m.focused = buttonIndex
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	got := updated.(model)
+	if got.submitted {
+		t.Fatal("expected submission to be blocked by the empty database field")
+	}
+	if got.focused != mysqlDatabase {
+		t.Fatalf("expected focus to jump to the invalid field, got %d", got.focused)
+	}
+	if got.err == nil {
+		t.Fatal("expected a validation error to display")
 	}
 }
 

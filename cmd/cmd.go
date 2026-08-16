@@ -32,6 +32,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// First Ctrl+C cancels the context for a graceful stop (checkpointed
+	// progress, recorded events); restoring default signal handling right
+	// after lets a second Ctrl+C terminate immediately.
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+
 	switch os.Getenv("LOG_LEVEL") {
 	case "debug":
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
@@ -50,9 +58,11 @@ func main() {
 	cmd.AddCommand(server.RegisterServerCommand())
 	cmd.AddCommand(version.RegisterVersionCommand())
 	cmd.AddCommand(cli.RegisterCliCommand())
+	cmd.AddCommand(cli.RegisterStatusCommand())
 
-	err = cmd.ExecuteContext(ctx)
-	if err != nil {
-		log.Fatal(err)
+	// Cobra already printed the error; exiting non-zero without re-logging
+	// avoids the duplicated final line.
+	if err := cmd.ExecuteContext(ctx); err != nil {
+		os.Exit(1)
 	}
 }

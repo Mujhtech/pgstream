@@ -3,10 +3,12 @@ package views
 import (
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-isatty"
 )
 
 var ErrCancelled = errors.New("operation cancelled")
@@ -62,7 +64,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 }
 
+// stdoutIsTerminal reports whether an animated spinner can render; without a
+// TTY (CI, piped output, nohup) the spinner degrades to one printed line.
+func stdoutIsTerminal() bool {
+	return isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
+}
+
 func WithSpinner(message string, fn func() error) (err error) {
+	if !stdoutIsTerminal() {
+		fmt.Println(message)
+		return fn()
+	}
 	runner := start(message, false)
 	defer func() {
 		err = errors.Join(err, runner.stop())
@@ -71,6 +83,10 @@ func WithSpinner(message string, fn func() error) (err error) {
 }
 
 func WithInlineSpinner(message string, fn func() error) (err error) {
+	if !stdoutIsTerminal() {
+		fmt.Println(message)
+		return fn()
+	}
 	runner := start(message, true)
 	defer func() {
 		err = errors.Join(err, runner.stop())
@@ -113,9 +129,9 @@ func (m model) View() string {
 
 	str := ""
 	if m.inline {
-		str = GetInfoMessage(fmt.Sprintf("%s %s...", m.spinner.View(), m.message))
+		str = GetInfoMessage(fmt.Sprintf("%s %s", m.spinner.View(), m.message))
 	} else {
-		str = DocStyle.Render(fmt.Sprintf("\n\n   %s %s...\n\n", m.spinner.View(), m.message))
+		str = DocStyle.Render(fmt.Sprintf("\n\n   %s %s\n\n", m.spinner.View(), m.message))
 	}
 
 	return str

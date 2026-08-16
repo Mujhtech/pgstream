@@ -4,15 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mujhtech/pgstream/internal/migrator"
-)
-
-type (
-	errMsg error
+	"github.com/mujhtech/pgstream/internal/utils/views"
 )
 
 const (
@@ -30,18 +28,64 @@ const (
 	postgresPassword
 	postgresDatabase
 	postgresSchema
+
+	fieldCount
+	// buttonIndex is the focus position of the Continue button, one past the
+	// last input.
+	buttonIndex = fieldCount
 )
 
-const (
-	hotPink  = lipgloss.Color("#FF06B7")
-	darkGray = lipgloss.Color("#767676")
-)
+const darkGray = lipgloss.Color("#767676")
 
 var (
-	inputStyle    = lipgloss.NewStyle().Foreground(hotPink)
-	continueStyle = lipgloss.NewStyle().Foreground(darkGray)
-	ErrCancelled  = errors.New("session setup cancelled")
+	titleStyle    = lipgloss.NewStyle().Bold(true)
+	sectionStyle  = lipgloss.NewStyle().Foreground(views.Primary).Bold(true)
+	labelFocused  = lipgloss.NewStyle().Foreground(views.Primary).Bold(true)
+	labelBlurred  = lipgloss.NewStyle().Foreground(darkGray)
+	markerFocused = lipgloss.NewStyle().Foreground(views.Primary).Render("▸ ")
+	markerBlurred = "  "
+	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	helpStyle     = lipgloss.NewStyle().Foreground(darkGray)
+	buttonFocused = lipgloss.NewStyle().Bold(true).Foreground(views.White).Background(views.Primary).Padding(0, 2)
+	buttonBlurred = lipgloss.NewStyle().Foreground(darkGray).Padding(0, 2)
+
+	ErrCancelled = errors.New("session setup cancelled")
 )
+
+// fieldSpec declares one form input; initialModel builds the whole form from
+// the table below so layout, defaults, and validation live in one place.
+type fieldSpec struct {
+	label       string
+	placeholder string
+	initial     string
+	width       int
+	charLimit   int
+	password    bool
+	validate    func(string) error
+}
+
+var fieldSpecs = [fieldCount]fieldSpec{
+	mysqlHost:        {label: "Host", placeholder: "127.0.0.1", initial: "127.0.0.1", width: 30, charLimit: 255, validate: hostValidator},
+	mysqlPort:        {label: "Port", placeholder: "3306", initial: "3306", width: 6, charLimit: 5, validate: portValidator},
+	mysqlUser:        {label: "User", placeholder: "root", initial: "root", width: 24, charLimit: 255, validate: userValidator},
+	mysqlPassword:    {label: "Password", placeholder: "password", width: 24, charLimit: 255, password: true, validate: passwordValidator},
+	mysqlDatabase:    {label: "Database", placeholder: "mydb", width: 24, charLimit: 64, validate: databaseValidator},
+	postgresHost:     {label: "Host", placeholder: "127.0.0.1", initial: "127.0.0.1", width: 30, charLimit: 255, validate: hostValidator},
+	postgresPort:     {label: "Port", placeholder: "5432", initial: "5432", width: 6, charLimit: 5, validate: portValidator},
+	postgresUser:     {label: "User", placeholder: "postgres", initial: "postgres", width: 24, charLimit: 255, validate: userValidator},
+	postgresPassword: {label: "Password", placeholder: "password", width: 24, charLimit: 255, password: true, validate: passwordValidator},
+	postgresDatabase: {label: "Database", placeholder: "mydb", width: 24, charLimit: 64, validate: databaseValidator},
+	postgresSchema:   {label: "Schema", placeholder: "public", initial: "public", width: 24, charLimit: 64, validate: schemaValidator},
+}
+
+var formSections = []struct {
+	title string
+	from  int
+	to    int
+}{
+	{title: "MySQL", from: mysqlHost, to: mysqlDatabase},
+	{title: "PostgreSQL", from: postgresHost, to: postgresSchema},
+}
 
 type model struct {
 	inputs    []textinput.Model
@@ -100,101 +144,27 @@ func schemaValidator(s string) error {
 }
 
 func initialModel() model {
-	var inputs []textinput.Model = make([]textinput.Model, 11)
-
-	// MySQL inputs
-	inputs[mysqlHost] = textinput.New()
-	inputs[mysqlHost].Placeholder = "127.0.0.1"
+	inputs := make([]textinput.Model, fieldCount)
+	for index, spec := range fieldSpecs {
+		input := textinput.New()
+		input.Placeholder = spec.placeholder
+		input.CharLimit = spec.charLimit
+		input.Width = spec.width
+		input.Prompt = ""
+		input.Validate = spec.validate
+		if spec.password {
+			input.EchoMode = textinput.EchoPassword
+		}
+		if spec.initial != "" {
+			input.SetValue(spec.initial)
+		}
+		inputs[index] = input
+	}
 	inputs[mysqlHost].Focus()
-	inputs[mysqlHost].CharLimit = 255
-	inputs[mysqlHost].Width = 255
-	inputs[mysqlHost].Prompt = ""
-	inputs[mysqlHost].Validate = hostValidator
-	inputs[mysqlHost].SetValue("127.0.0.1")
-
-	inputs[mysqlPort] = textinput.New()
-	inputs[mysqlPort].Placeholder = "3306"
-	inputs[mysqlPort].CharLimit = 10
-	inputs[mysqlPort].Width = 15
-	inputs[mysqlPort].Prompt = ""
-	inputs[mysqlPort].Validate = portValidator
-	inputs[mysqlPort].SetValue("3306")
-
-	inputs[mysqlUser] = textinput.New()
-	inputs[mysqlUser].Placeholder = "root"
-	inputs[mysqlUser].CharLimit = 255
-	inputs[mysqlUser].Width = 30
-	inputs[mysqlUser].Prompt = ""
-	inputs[mysqlUser].Validate = userValidator
-	inputs[mysqlUser].SetValue("root")
-
-	inputs[mysqlPassword] = textinput.New()
-	inputs[mysqlPassword].Placeholder = "password"
-	inputs[mysqlPassword].CharLimit = 255
-	inputs[mysqlPassword].Width = 30
-	inputs[mysqlPassword].Prompt = ""
-	inputs[mysqlPassword].EchoMode = textinput.EchoPassword
-	inputs[mysqlPassword].Validate = passwordValidator
-
-	inputs[mysqlDatabase] = textinput.New()
-	inputs[mysqlDatabase].Placeholder = "mydb"
-	inputs[mysqlDatabase].CharLimit = 50
-	inputs[mysqlDatabase].Width = 30
-	inputs[mysqlDatabase].Prompt = ""
-	inputs[mysqlDatabase].Validate = databaseValidator
-
-	// PostgreSQL inputs
-	inputs[postgresHost] = textinput.New()
-	inputs[postgresHost].Placeholder = "127.0.0.1"
-	inputs[postgresHost].CharLimit = 255
-	inputs[postgresHost].Width = 255
-	inputs[postgresHost].Prompt = ""
-	inputs[postgresHost].Validate = hostValidator
-	inputs[postgresHost].SetValue("127.0.0.1")
-
-	inputs[postgresPort] = textinput.New()
-	inputs[postgresPort].Placeholder = "5432"
-	inputs[postgresPort].CharLimit = 10
-	inputs[postgresPort].Width = 15
-	inputs[postgresPort].Prompt = ""
-	inputs[postgresPort].Validate = portValidator
-	inputs[postgresPort].SetValue("5432")
-
-	inputs[postgresUser] = textinput.New()
-	inputs[postgresUser].Placeholder = "postgres"
-	inputs[postgresUser].CharLimit = 255
-	inputs[postgresUser].Width = 30
-	inputs[postgresUser].Prompt = ""
-	inputs[postgresUser].Validate = userValidator
-	inputs[postgresUser].SetValue("postgres")
-
-	inputs[postgresPassword] = textinput.New()
-	inputs[postgresPassword].Placeholder = "password"
-	inputs[postgresPassword].CharLimit = 255
-	inputs[postgresPassword].Width = 15
-	inputs[postgresPassword].Prompt = ""
-	inputs[postgresPassword].EchoMode = textinput.EchoPassword
-	inputs[postgresPassword].Validate = passwordValidator
-
-	inputs[postgresDatabase] = textinput.New()
-	inputs[postgresDatabase].Placeholder = "mydb"
-	inputs[postgresDatabase].CharLimit = 50
-	inputs[postgresDatabase].Width = 15
-	inputs[postgresDatabase].Prompt = ""
-	inputs[postgresDatabase].Validate = databaseValidator
-
-	inputs[postgresSchema] = textinput.New()
-	inputs[postgresSchema].Placeholder = "public"
-	inputs[postgresSchema].CharLimit = 50
-	inputs[postgresSchema].Width = 30
-	inputs[postgresSchema].Prompt = ""
-	inputs[postgresSchema].Validate = schemaValidator
-	inputs[postgresSchema].SetValue("public")
 
 	return model{
 		inputs:  inputs,
-		focused: 0,
-		err:     nil,
+		focused: mysqlHost,
 	}
 }
 
@@ -203,105 +173,98 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmds []tea.Cmd = make([]tea.Cmd, len(m.inputs))
+	cmds := make([]tea.Cmd, len(m.inputs))
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyEnter:
-			if err := m.validateInput(m.focused); err != nil {
-				return m, nil
-			}
-			if m.focused == len(m.inputs)-1 {
+			if m.focused == buttonIndex {
 				if err := m.validateAllInputs(); err != nil {
+					m.syncFocus()
 					return m, nil
 				}
 				m.submitted = true
 				return m, tea.Quit
 			}
-			m.nextInput()
-		case tea.KeyCtrlC, tea.KeyEsc:
-			m.cancelled = true
-			return m, tea.Quit
-		case tea.KeyShiftTab, tea.KeyCtrlP:
-			m.prevInput()
-		case tea.KeyTab, tea.KeyCtrlN:
 			if err := m.validateInput(m.focused); err != nil {
 				return m, nil
 			}
 			m.nextInput()
+		case tea.KeyCtrlC, tea.KeyEsc:
+			m.cancelled = true
+			return m, tea.Quit
+		case tea.KeyShiftTab, tea.KeyCtrlP, tea.KeyUp:
+			// Moving backwards never blocks on validation.
+			m.prevInput()
+		case tea.KeyTab, tea.KeyCtrlN, tea.KeyDown:
+			if m.focused != buttonIndex {
+				if err := m.validateInput(m.focused); err != nil {
+					return m, nil
+				}
+			}
+			m.nextInput()
 		}
-		for i := range m.inputs {
-			m.inputs[i].Blur()
-		}
-		m.inputs[m.focused].Focus()
-
-	// We handle errors just like any other message
-	case errMsg:
-		m.err = msg
-		return m, nil
+		m.syncFocus()
 	}
 
 	for i := range m.inputs {
 		m.inputs[i], cmds[i] = m.inputs[i].Update(msg)
 	}
-	m.err = m.inputs[m.focused].Err
+	if m.focused < fieldCount {
+		m.err = m.inputs[m.focused].Err
+	}
 	return m, tea.Batch(cmds...)
 }
 
+// syncFocus blurs every input and focuses the current one (none when the
+// Continue button holds focus).
+func (m *model) syncFocus() {
+	for i := range m.inputs {
+		m.inputs[i].Blur()
+	}
+	if m.focused < fieldCount {
+		m.inputs[m.focused].Focus()
+	}
+}
+
 func (m model) View() string {
-	errorMessage := ""
-	if m.err != nil {
-		errorMessage = inputStyle.Render(m.err.Error())
+	var view strings.Builder
+	view.WriteString("\n  ")
+	view.WriteString(titleStyle.Render("pgstream — start a new migration session"))
+	view.WriteString("\n")
+
+	for _, section := range formSections {
+		view.WriteString("\n  ")
+		view.WriteString(sectionStyle.Render(section.title))
+		view.WriteString("\n")
+		for index := section.from; index <= section.to; index++ {
+			marker, label := markerBlurred, labelBlurred
+			if index == m.focused {
+				marker, label = markerFocused, labelFocused
+			}
+			fmt.Fprintf(&view, "  %s%s %s\n", marker, label.Width(10).Render(fieldSpecs[index].label), m.inputs[index].View())
+		}
 	}
 
-	return fmt.Sprintf(
-		` Start a new session:
+	view.WriteString("\n  ")
+	if m.focused == buttonIndex {
+		view.WriteString(buttonFocused.Render("Continue"))
+	} else {
+		view.WriteString(buttonBlurred.Render("[ Continue ]"))
+	}
+	view.WriteString("\n")
 
- MySQL Configuration:
- %s %s
- %s %s
- %s %s
- %s %s
- %s %s
+	if m.err != nil {
+		view.WriteString("\n  ")
+		view.WriteString(errorStyle.Render("✗ " + m.err.Error()))
+		view.WriteString("\n")
+	}
 
-
- PostgreSQL Configuration:
- %s %s
- %s %s
- %s %s
- %s %s
- %s %s
- %s %s
-
-	 %s
-	 %s
-	`,
-		inputStyle.Width(20).Render("MySQL Host"),
-		m.inputs[mysqlHost].View(),
-		inputStyle.Width(20).Render("MySQL Port"),
-		m.inputs[mysqlPort].View(),
-		inputStyle.Width(20).Render("MySQL User"),
-		m.inputs[mysqlUser].View(),
-		inputStyle.Width(20).Render("MySQL Password"),
-		m.inputs[mysqlPassword].View(),
-		inputStyle.Width(20).Render("MySQL Database"),
-		m.inputs[mysqlDatabase].View(),
-		inputStyle.Width(20).Render("PostgreSQL Host"),
-		m.inputs[postgresHost].View(),
-		inputStyle.Width(20).Render("PostgreSQL Port"),
-		m.inputs[postgresPort].View(),
-		inputStyle.Width(20).Render("PostgreSQL User"),
-		m.inputs[postgresUser].View(),
-		inputStyle.Width(20).Render("PostgreSQL Password"),
-		m.inputs[postgresPassword].View(),
-		inputStyle.Width(20).Render("PostgreSQL Database"),
-		m.inputs[postgresDatabase].View(),
-		inputStyle.Width(20).Render("PostgreSQL Schema"),
-		m.inputs[postgresSchema].View(),
-		continueStyle.Render("Continue ->"),
-		errorMessage,
-	) + "\n"
+	view.WriteString("\n  ")
+	view.WriteString(helpStyle.Render("tab/↓ next · shift+tab/↑ back · enter continue · esc cancel"))
+	view.WriteString("\n")
+	return view.String()
 }
 
 func (m *model) validateInput(index int) error {
@@ -324,27 +287,22 @@ func (m *model) validateAllInputs() error {
 	for index := range m.inputs {
 		if err := m.validateInput(index); err != nil {
 			m.focused = index
-			for inputIndex := range m.inputs {
-				m.inputs[inputIndex].Blur()
-			}
-			m.inputs[index].Focus()
 			return err
 		}
 	}
 	return nil
 }
 
-// nextInput focuses the next input field
+// nextInput focuses the next input field, including the Continue button.
 func (m *model) nextInput() {
-	m.focused = (m.focused + 1) % len(m.inputs)
+	m.focused = (m.focused + 1) % (fieldCount + 1)
 }
 
-// prevInput focuses the previous input field
+// prevInput focuses the previous input field, wrapping through the button.
 func (m *model) prevInput() {
 	m.focused--
-	// Wrap around
 	if m.focused < 0 {
-		m.focused = len(m.inputs) - 1
+		m.focused = buttonIndex
 	}
 }
 
