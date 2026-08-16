@@ -401,8 +401,49 @@ func (m *Migrator) createTableInPostgres(ctx context.Context, table string) erro
 		return fmt.Errorf("failed to create primary key for %s: %w", table, err)
 	}
 
-	m.logf("✅ Created table %s.%s (%d columns)\n", m.schemaName, table, len(mysqlColumns))
+	commentCount, err := m.applyComments(ctx, table, mysqlColumns)
+	if err != nil {
+		return fmt.Errorf("failed to migrate comments for %s: %w", table, err)
+	}
+
+	commentNote := ""
+	if commentCount > 0 {
+		commentNote = fmt.Sprintf(", %d comments", commentCount)
+	}
+	m.logf("✅ Created table %s.%s (%d columns%s)\n", m.schemaName, table, len(mysqlColumns), commentNote)
 	return nil
+}
+
+// applyComments carries MySQL table and column comments to the target as
+// COMMENT ON statements, returning how many were applied. Comments only
+// accompany table creation; pre-existing target tables are never modified.
+func (m *Migrator) applyComments(ctx context.Context, table string, columns []ColumnInfo) (int, error) {
+	applied := 0
+	qualified := quotePostgresIdentifier(m.schemaName) + "." + quotePostgresIdentifier(table)
+
+	tableComment, err := m.getMySQLTableComment(ctx, table)
+	if err != nil {
+		return applied, err
+	}
+	if tableComment != "" {
+		statement := fmt.Sprintf("COMMENT ON TABLE %s IS %s", qualified, quotePostgresLiteral(tableComment))
+		if _, err := m.postgres.GetDB().ExecContext(ctx, statement); err != nil {
+			return applied, fmt.Errorf("comment on table %s: %w", table, err)
+		}
+		applied++
+	}
+
+	for _, col := range columns {
+		if col.Comment == "" {
+			continue
+		}
+		statement := fmt.Sprintf("COMMENT ON COLUMN %s.%s IS %s", qualified, quotePostgresIdentifier(col.Name), quotePostgresLiteral(col.Comment))
+		if _, err := m.postgres.GetDB().ExecContext(ctx, statement); err != nil {
+			return applied, fmt.Errorf("comment on column %s.%s: %w", table, col.Name, err)
+		}
+		applied++
+	}
+	return applied, nil
 }
 
 func (m *Migrator) ensurePrimaryKey(ctx context.Context, table string) error {
@@ -829,23 +870,7 @@ func (m *Migrator) createAllTables(ctx context.Context, tables []string) error {
 		}
 
 		if exists {
-			if m.freshSession {
-				targetRows, err := m.targetTableRowCount(ctx, table)
-				if err != nil {
-					return fmt.Errorf("count existing target table %s: %w", table, err)
-				}
-				if targetRows != 0 {
-					return fmt.Errorf("target table %s.%s contains %d rows; a fresh session requires empty target tables", m.schemaName, table, targetRows)
-				}
-			}
-			if err := m.ensurePrimaryKey(ctx, table); err != nil {
-				return fmt.Errorf("failed to ensure primary key for %s: %w", table, err)
-			}
-			// A pre-existing table may carry UUID decisions from an earlier
-			// run that this run's data-driven resolution disagrees with;
-			// surfacing that now costs seconds, discovering it at the
-			// foreign-key stage costs the whole copy.
-			if err := m.verifyExistingUUIDDecisions(ctx, table); err != nil {
+			if err := m.verifyExistingTable(ctx, table); err != nil {
 				return err
 			}
 			m.logf("⏭️  Table %s already exists, verified primary key\n", table)
@@ -859,6 +884,68 @@ func (m *Migrator) createAllTables(ctx context.Context, tables []string) error {
 	}
 
 	return nil
+}
+
+// verifyExistingTable checks a pre-existing target table against this run's
+// expectations: empty when the session is fresh, primary key matching the
+// source, and UUID decisions consistent with this run's data-driven
+// resolution. Surfacing a mismatch now costs seconds; discovering it at the
+// foreign-key stage costs the whole copy.
+func (m *Migrator) verifyExistingTable(ctx context.Context, table string) error {
+	if m.freshSession {
+		targetRows, err := m.targetTableRowCount(ctx, table)
+		if err != nil {
+			return fmt.Errorf("count existing target table %s: %w", table, err)
+		}
+		if targetRows != 0 {
+			return fmt.Errorf("target table %s.%s contains %d rows; a fresh session requires empty target tables", m.schemaName, table, targetRows)
+		}
+	}
+	if err := m.ensurePrimaryKey(ctx, table); err != nil {
+		return fmt.Errorf("failed to ensure primary key for %s: %w", table, err)
+	}
+	return m.verifyExistingUUIDDecisions(ctx, table)
+}
+
+// verifyTablesForDataOnly replaces table creation when the run is data-only:
+// every selected table must already exist on the target (from a prior full or
+// schema-only run) and pass the same verification a resume performs.
+func (m *Migrator) verifyTablesForDataOnly(ctx context.Context, tables []string) error {
+	for _, table := range tables {
+		exists, err := m.tableExistsInPostgres(ctx, table)
+		if err != nil {
+			return fmt.Errorf("failed to check if table %s exists: %w", table, err)
+		}
+		if !exists {
+			return fmt.Errorf("target table %s.%s does not exist; run a full migration or --schema-only first", m.schemaName, table)
+		}
+		if err := m.verifyExistingTable(ctx, table); err != nil {
+			return err
+		}
+	}
+
+	// A full run creates foreign keys after the copy, so load order never
+	// matters. A data-only run inherits whatever constraints the target
+	// already carries; loading child tables before their parents would then
+	// fail, so the hazard is called out up front.
+	fkCount, err := m.targetForeignKeyCount(ctx)
+	if err != nil {
+		return fmt.Errorf("count target foreign keys: %w", err)
+	}
+	if fkCount > 0 {
+		m.warnf("⚠️  Target schema %s already has %d foreign key constraints; a data-only load copies tables in discovery order and may violate them. If the load fails, drop the constraints, re-run, and restore them afterwards (a full run creates them after the data for this reason)", m.schemaName, fkCount)
+	}
+	return nil
+}
+
+func (m *Migrator) targetForeignKeyCount(ctx context.Context) (int, error) {
+	var count int
+	err := m.postgres.GetDB().QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM information_schema.table_constraints
+		WHERE constraint_schema = $1 AND constraint_type = 'FOREIGN KEY'
+	`, m.schemaName).Scan(&count)
+	return count, err
 }
 
 func (m *Migrator) targetTableRowCount(ctx context.Context, table string) (int64, error) {

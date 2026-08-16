@@ -270,6 +270,7 @@ func (m *Migrator) getMySQLTableStructure(ctx context.Context, table string) ([]
 			column_info.EXTRA,
 			column_info.COLUMN_KEY,
 			column_info.GENERATION_EXPRESSION,
+			column_info.COLUMN_COMMENT,
 			EXISTS(
 				SELECT 1
 				FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE key_info
@@ -301,10 +302,11 @@ func (m *Migrator) getMySQLTableStructure(ctx context.Context, table string) ([]
 		var column ColumnInfo
 		var nullable, columnKey string
 		var referencesUUID bool
-		var defaultValue, generationExpression sql.NullString
-		if err := rows.Scan(&column.Name, &column.Type, &nullable, &defaultValue, &column.Extra, &columnKey, &generationExpression, &referencesUUID); err != nil {
+		var defaultValue, generationExpression, comment sql.NullString
+		if err := rows.Scan(&column.Name, &column.Type, &nullable, &defaultValue, &column.Extra, &columnKey, &generationExpression, &comment, &referencesUUID); err != nil {
 			return nil, err
 		}
+		column.Comment = comment.String
 		column.Nullable = nullable == "YES"
 		column.HasDefault = defaultValue.Valid
 		column.DefaultValue = defaultValue.String
@@ -358,6 +360,9 @@ type ColumnInfo struct {
 	// CastType carries a user cast rule's target type; it replaces the
 	// built-in mapping and exempts the column from UUID conversion.
 	CastType string
+	// Comment is the MySQL column comment, carried to the target as
+	// COMMENT ON COLUMN.
+	Comment string
 }
 
 // isGeneratedColumn reports whether EXTRA marks a MySQL VIRTUAL or STORED
@@ -370,6 +375,20 @@ func isGeneratedColumn(extra string) bool {
 type sourceTable struct {
 	name   string
 	engine string
+}
+
+// getMySQLTableComment reads the source table's comment, empty when unset.
+func (m *Migrator) getMySQLTableComment(ctx context.Context, table string) (string, error) {
+	var comment sql.NullString
+	err := m.sourceQueryer(ctx).QueryRowContext(ctx, `
+		SELECT TABLE_COMMENT
+		FROM INFORMATION_SCHEMA.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+	`, table).Scan(&comment)
+	if err != nil {
+		return "", fmt.Errorf("read table comment for %s: %w", table, err)
+	}
+	return comment.String, nil
 }
 
 // getMySQLTables retrieves all base table names and storage engines from MySQL.

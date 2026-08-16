@@ -35,6 +35,9 @@ type sessionOptions struct {
 	skipSnapshotLock  bool
 	sourceCompression bool
 	casts             []string
+	schemaOnly        bool
+	dataOnly          bool
+	targetTuning      bool
 }
 
 func RegisterCliCommand() *cobra.Command {
@@ -89,13 +92,32 @@ func RegisterCliCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&opts.skipSnapshotLock, "skip-snapshot-lock", false, "skip the snapshot alignment lock; only safe when the source receives no writes during the migration")
 	cmd.Flags().StringArrayVar(&opts.casts, "cast", nil, "type-mapping override, repeatable: 'table.column=TYPE' or 'mysqltype=TYPE' (e.g. --cast 'jobs.id=text' --cast 'datetime=timestamptz')")
 	cmd.Flags().BoolVar(&opts.sourceCompression, "source-compression", true, "zlib-compress the MySQL connection; a large win for remote sources, disable with --source-compression=false")
+	cmd.Flags().BoolVar(&opts.schemaOnly, "schema-only", false, "create tables, indexes, and foreign keys but copy no data")
+	cmd.Flags().BoolVar(&opts.dataOnly, "data-only", false, "copy data into tables a previous run created; skips all DDL")
+	cmd.Flags().BoolVar(&opts.targetTuning, "target-tuning", true, "raise maintenance_work_mem on the PostgreSQL target for faster index builds; disable with --target-tuning=false")
 	cmd.MarkFlagsMutuallyExclusive("include-tables", "exclude-tables")
 
 	return cmd
 
 }
 
+// cliPhase maps the mutually exclusive phase flags onto the engine's Phase.
+func cliPhase(opts sessionOptions) migrator.Phase {
+	switch {
+	case opts.schemaOnly:
+		return migrator.PhaseSchemaOnly
+	case opts.dataOnly:
+		return migrator.PhaseDataOnly
+	default:
+		return migrator.PhaseAll
+	}
+}
+
 func cliSession(ctx context.Context, storage *storage.Storage, sessionCipher encrypt.Encrypt, opts sessionOptions) error {
+
+	if opts.schemaOnly && opts.dataOnly {
+		return fmt.Errorf("--schema-only and --data-only are mutually exclusive")
+	}
 
 	var inputs migrator.Config
 	var err error
@@ -224,7 +246,7 @@ func cliSession(ctx context.Context, storage *storage.Storage, sessionCipher enc
 			return err
 		}
 
-		postgresConnector, err = database.ConnectPostgresPreferSSL(ctx, config.Database{
+		postgresConnector, err = database.ConnectPostgresTarget(ctx, config.Database{
 			Driver:   config.DatabaseDriverPostgres,
 			Host:     inputs.PostgreSQL.Host,
 			Port:     port,
@@ -232,7 +254,7 @@ func cliSession(ctx context.Context, storage *storage.Storage, sessionCipher enc
 			Schema:   inputs.PostgreSQL.Schema,
 			Password: inputs.PostgreSQL.Password,
 			Database: inputs.PostgreSQL.Database,
-		})
+		}, opts.targetTuning)
 
 		if err != nil {
 			return err
@@ -261,6 +283,7 @@ func cliSession(ctx context.Context, storage *storage.Storage, sessionCipher enc
 		migrator.WithWorkers(opts.workers),
 		migrator.WithSkipSnapshotLock(opts.skipSnapshotLock),
 		migrator.WithCastRules(opts.casts),
+		migrator.WithPhase(cliPhase(opts)),
 	}
 
 	// Persist engine events so the server, web UI, and `pgstream status`

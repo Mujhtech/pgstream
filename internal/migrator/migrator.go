@@ -25,6 +25,7 @@ type Migrator struct {
 	freshSession   bool
 	filter         *tableFilter
 	casts          *castRules
+	phase          Phase
 	loadMethod     LoadMethod
 	sink           EventSink
 	workers        int
@@ -71,6 +72,34 @@ func WithTableFilter(include, exclude []string) Option {
 		}
 		migrator.filter = filter
 		return nil
+	}
+}
+
+// Phase restricts a run to part of the migration, in the spirit of
+// pgloader's "schema only" and "data only" options.
+type Phase string
+
+const (
+	// PhaseAll runs the full migration: tables, data, then schema objects.
+	PhaseAll Phase = ""
+	// PhaseSchemaOnly creates tables and schema objects (indexes, foreign
+	// keys, triggers) but copies no data.
+	PhaseSchemaOnly Phase = "schema-only"
+	// PhaseDataOnly copies data into tables that already exist (from a full
+	// or schema-only run) and skips schema object migration.
+	PhaseDataOnly Phase = "data-only"
+)
+
+// WithPhase restricts the run to the schema or data portion of a migration.
+func WithPhase(phase Phase) Option {
+	return func(migrator *Migrator) error {
+		switch phase {
+		case PhaseAll, PhaseSchemaOnly, PhaseDataOnly:
+			migrator.phase = phase
+			return nil
+		default:
+			return fmt.Errorf("unsupported phase %q; use %q or %q", phase, PhaseSchemaOnly, PhaseDataOnly)
+		}
 	}
 }
 
@@ -206,11 +235,19 @@ func (m *Migrator) Start(ctx context.Context) error {
 		return fmt.Errorf("resolve UUID conversions: %w", err)
 	}
 
-	// Step 3: Create all tables in PostgreSQL (structure only)
-	m.logf("🏗️  Step 1: Creating table structures...")
+	// Step 3: Create all tables in PostgreSQL (structure only). A data-only
+	// run verifies the tables a prior run created instead of creating any.
 	schemaPhaseStart := time.Now()
-	if err := m.createAllTables(ctx, tables); err != nil {
-		return fmt.Errorf("failed to create tables: %w", err)
+	if m.phase == PhaseDataOnly {
+		m.logf("🏗️  Step 1: Verifying existing table structures (--data-only)...")
+		if err := m.verifyTablesForDataOnly(ctx, tables); err != nil {
+			return fmt.Errorf("verify tables for data-only run: %w", err)
+		}
+	} else {
+		m.logf("🏗️  Step 1: Creating table structures...")
+		if err := m.createAllTables(ctx, tables); err != nil {
+			return fmt.Errorf("failed to create tables: %w", err)
+		}
 	}
 	if m.freshSession {
 		if err := m.validateFreshTargetTables(ctx, tables); err != nil {
@@ -226,7 +263,9 @@ func (m *Migrator) Start(ctx context.Context) error {
 		workers = len(tables)
 	}
 	dataPhaseStart := time.Now()
-	if workers > 1 {
+	if m.phase == PhaseSchemaOnly {
+		m.logf("📦 Step 2: Skipping data migration (--schema-only)")
+	} else if workers > 1 {
 		m.logf("📦 Step 2: Migrating data (%d tables, %d workers)...", len(tables), workers)
 		snapshots, err := m.beginAlignedSnapshots(ctx, workers)
 		if err != nil {
@@ -255,25 +294,33 @@ func (m *Migrator) Start(ctx context.Context) error {
 
 	dataPhase := time.Since(dataPhaseStart)
 	rowsCopied := m.rowsCopiedThisRun.Load()
-	throughput := ""
-	if seconds := dataPhase.Seconds(); seconds > 0 && rowsCopied > 0 {
-		throughput = fmt.Sprintf(", %.0f rows/s", float64(rowsCopied)/seconds)
+	if m.phase != PhaseSchemaOnly {
+		throughput := ""
+		if seconds := dataPhase.Seconds(); seconds > 0 && rowsCopied > 0 {
+			throughput = fmt.Sprintf(", %.0f rows/s", float64(rowsCopied)/seconds)
+		}
+		m.logf("📦 Step 2 finished in %s (%d rows copied this run%s)", formatDuration(dataPhase), rowsCopied, throughput)
 	}
-	m.logf("📦 Step 2 finished in %s (%d rows copied this run%s)", formatDuration(dataPhase), rowsCopied, throughput)
 
-	// Step 5: Create schema objects after the data is in place.
-	m.logf("🔧 Step 3: Migrating schema objects...")
-	indexPhaseStart := time.Now()
-	schemaErr := m.migrateAllSchemaObjects(ctx, tables)
-	// DDL that needs a human decision is persisted even when schema object
-	// migration reported errors.
-	if err := m.writeManualStatements(); err != nil {
-		m.warnf("⚠️  Failed to write manual DDL file: %v", err)
+	// Step 5: Create schema objects after the data is in place. A data-only
+	// run leaves them to a later full or schema-only run so partial loads
+	// never carry half-built constraints.
+	if m.phase == PhaseDataOnly {
+		m.logf("🔧 Step 3: Skipping schema object migration (--data-only)")
+	} else {
+		m.logf("🔧 Step 3: Migrating schema objects...")
+		indexPhaseStart := time.Now()
+		schemaErr := m.migrateAllSchemaObjects(ctx, tables)
+		// DDL that needs a human decision is persisted even when schema object
+		// migration reported errors.
+		if err := m.writeManualStatements(); err != nil {
+			m.warnf("⚠️  Failed to write manual DDL file: %v", err)
+		}
+		if schemaErr != nil {
+			return fmt.Errorf("failed to migrate schema objects: %w", schemaErr)
+		}
+		m.logf("🔧 Step 3 finished in %s", formatDuration(time.Since(indexPhaseStart)))
 	}
-	if schemaErr != nil {
-		return fmt.Errorf("failed to migrate schema objects: %w", schemaErr)
-	}
-	m.logf("🔧 Step 3 finished in %s", formatDuration(time.Since(indexPhaseStart)))
 
 	m.logf("✅ Migration completed successfully in %s (%d rows copied this run)", formatDuration(time.Since(runStart)), rowsCopied)
 	return nil

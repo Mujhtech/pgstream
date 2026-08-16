@@ -75,6 +75,11 @@ type sessionRequest struct {
 	// Casts are pgloader-style type overrides: "table.column=TYPE" or
 	// "mysqltype=TYPE".
 	Casts []string `json:"casts,omitempty"`
+	// Phase restricts the run: "schema-only" or "data-only" (empty runs all).
+	Phase string `json:"phase,omitempty"`
+	// DisableTargetTuning opts out of PostgreSQL session tuning (on by
+	// default; the zero value keeps it enabled).
+	DisableTargetTuning bool `json:"disable_target_tuning,omitempty"`
 }
 
 type resumeRequest struct {
@@ -86,6 +91,8 @@ type resumeRequest struct {
 	SkipSnapshotLock         bool     `json:"skip_snapshot_lock,omitempty"`
 	DisableSourceCompression bool     `json:"disable_source_compression,omitempty"`
 	Casts                    []string `json:"casts,omitempty"`
+	Phase                    string   `json:"phase,omitempty"`
+	DisableTargetTuning      bool     `json:"disable_target_tuning,omitempty"`
 }
 
 type runOptions struct {
@@ -97,6 +104,8 @@ type runOptions struct {
 	skipSnapshotLock         bool
 	disableSourceCompression bool
 	casts                    []string
+	phase                    string
+	disableTargetTuning      bool
 	fresh                    bool
 }
 
@@ -310,6 +319,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		skipSnapshotLock:         request.SkipSnapshotLock,
 		disableSourceCompression: request.DisableSourceCompression,
 		casts:                    request.Casts,
+		phase:                    request.Phase,
+		disableTargetTuning:      request.DisableTargetTuning,
 		fresh:                    true,
 	}
 	if err := s.startRun(sessionID, inputs, options); err != nil {
@@ -350,6 +361,8 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request) {
 		skipSnapshotLock:         request.SkipSnapshotLock,
 		disableSourceCompression: request.DisableSourceCompression,
 		casts:                    request.Casts,
+		phase:                    request.Phase,
+		disableTargetTuning:      request.DisableTargetTuning,
 		fresh:                    false,
 	}
 	if err := s.startRun(sessionID, inputs, options); err != nil {
@@ -479,7 +492,7 @@ func (s *Server) executeMigration(ctx context.Context, sessionID string, inputs 
 	defer mysqlConnector.Close()
 
 	sink(migrator.Event{Time: time.Now(), Level: migrator.EventInfo, Message: fmt.Sprintf("🔌 Connecting to PostgreSQL %s@%s:%d/%s...", inputs.PostgreSQL.User, inputs.PostgreSQL.Host, postgresPort, inputs.PostgreSQL.Database)})
-	postgresConnector, err := database.ConnectPostgresPreferSSL(ctx, config.Database{
+	postgresConnector, err := database.ConnectPostgresTarget(ctx, config.Database{
 		Driver:   config.DatabaseDriverPostgres,
 		Host:     inputs.PostgreSQL.Host,
 		Port:     postgresPort,
@@ -487,7 +500,7 @@ func (s *Server) executeMigration(ctx context.Context, sessionID string, inputs 
 		Schema:   inputs.PostgreSQL.Schema,
 		Password: inputs.PostgreSQL.Password,
 		Database: inputs.PostgreSQL.Database,
-	})
+	}, !options.disableTargetTuning)
 	if err != nil {
 		return fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
@@ -499,6 +512,7 @@ func (s *Server) executeMigration(ctx context.Context, sessionID string, inputs 
 		migrator.WithTableFilter(options.includeTables, options.excludeTables),
 		migrator.WithSkipSnapshotLock(options.skipSnapshotLock),
 		migrator.WithCastRules(options.casts),
+		migrator.WithPhase(migrator.Phase(options.phase)),
 	}
 	if options.workers > 0 {
 		migratorOptions = append(migratorOptions, migrator.WithWorkers(options.workers))

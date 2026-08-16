@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -41,12 +42,36 @@ func Connect(ctx context.Context, cfg config.Database) (*Database, error) {
 	}, nil
 }
 
+// targetTuningParameters are the session settings applied to migration-target
+// connections, following pgloader's defaults: a raised maintenance_work_mem
+// speeds up the post-copy CREATE INDEX phase. Only allocation limits belong
+// here — settings that trade durability for speed (synchronous_commit) do
+// not, because pgstream's resume checkpoints assume acknowledged commits
+// survive a target crash.
+const targetTuningParameters = "-c maintenance_work_mem=128MB"
+
+// ConnectPostgresTarget connects to a migration target, optionally applying
+// session tuning to every pooled connection via the startup "options"
+// parameter. Connection poolers such as PgBouncer reject startup options, so
+// a rejection falls back to an untuned connection instead of failing.
+func ConnectPostgresTarget(ctx context.Context, cfg config.Database, tune bool) (*Database, error) {
+	if tune {
+		tuned := cfg
+		tuned.Options = joinOptions(cfg.Options, "options="+url.QueryEscape(targetTuningParameters))
+		db, err := ConnectPostgresPreferSSL(ctx, tuned)
+		if err == nil || !isStartupParameterUnsupported(err) {
+			return db, err
+		}
+	}
+	return ConnectPostgresPreferSSL(ctx, cfg)
+}
+
 // ConnectPostgresPreferSSL implements sslmode=prefer semantics for lib/pq,
 // which does not support "prefer" natively: attempt an SSL connection first
 // and fall back to plaintext only when the server has SSL disabled.
 func ConnectPostgresPreferSSL(ctx context.Context, cfg config.Database) (*Database, error) {
 	secure := cfg
-	secure.Options = "sslmode=require&connect_timeout=30"
+	secure.Options = joinOptions(cfg.Options, "sslmode=require&connect_timeout=30")
 	db, err := Connect(ctx, secure)
 	if err == nil {
 		return db, nil
@@ -56,8 +81,25 @@ func ConnectPostgresPreferSSL(ctx context.Context, cfg config.Database) (*Databa
 	}
 
 	insecure := cfg
-	insecure.Options = "sslmode=disable&connect_timeout=30"
+	insecure.Options = joinOptions(cfg.Options, "sslmode=disable&connect_timeout=30")
 	return Connect(ctx, insecure)
+}
+
+// joinOptions merges query-string fragments, skipping empty parts.
+func joinOptions(parts ...string) string {
+	nonEmpty := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "" {
+			nonEmpty = append(nonEmpty, part)
+		}
+	}
+	return strings.Join(nonEmpty, "&")
+}
+
+// isStartupParameterUnsupported reports a server or pooler rejecting the
+// startup "options" parameter, PgBouncer's documented behavior.
+func isStartupParameterUnsupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "unsupported startup parameter")
 }
 
 // isPostgresSSLUnsupported reports whether the connection failed because the

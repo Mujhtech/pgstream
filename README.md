@@ -46,6 +46,9 @@ Starts a migration. Without `--id` it prompts interactively for the MySQL and Po
 | `--load-method copy\|insert` | `copy` | How batches are written to PostgreSQL |
 | `--workers <n>` | `1` | Tables migrated concurrently (max 16) |
 | `--cast <rule>` | — | Override a type mapping, repeatable (see below) |
+| `--schema-only` | off | Create tables, indexes, and foreign keys; copy no data |
+| `--data-only` | off | Copy data into tables a previous run created; no DDL |
+| `--target-tuning` | on | Raise `maintenance_work_mem` on the target for faster index builds |
 | `--skip-snapshot-lock` | off | Skip the multi-worker snapshot alignment lock (see below) |
 | `--source-compression` | on | zlib compression on the MySQL connection |
 
@@ -56,6 +59,8 @@ Notes on each:
 - **`--load-method copy`** (default) streams batches through the PostgreSQL COPY protocol; the first batch after a resume still uses conflict-targeted inserts so replayed rows stay idempotent. `insert` keeps multi-row INSERTs. On a real 1.6M-row production backup, COPY cut end-to-end migration time by 1.84× and doubled large-table throughput — see [BENCHMARKS.md](BENCHMARKS.md).
 - **`--id`** resumes primary-keyed tables from their last committed batch. Keyless tables cannot resume; truncate their partial target and re-run. Resuming is also how skipped foreign keys are retried after missing source tables are restored.
 - **`--cast`** overrides the built-in type mapping, in the spirit of pgloader's CAST clauses. Two rule forms, both repeatable: `table.column=TYPE` pins one column (highest precedence), and `mysqltype=TYPE` rewrites every column whose MySQL type starts with that prefix (first matching rule wins). Typical uses: `--cast 'tinyint(1)=smallint'` when a "boolean" column actually stores 0–2, `--cast 'datetime=timestamptz'` to get timezone-aware timestamps, `--cast 'jobs.id=text'` to keep a UUID-shaped key as text. A cast is authoritative: it replaces the built-in mapping, exempts the column from native-UUID conversion, and data validation follows the cast type. `--dry-run` lists every applied cast per column.
+- **`--schema-only` / `--data-only`** split a migration the way pgloader's `schema only`/`data only` options do. `--schema-only` runs table creation and all schema objects (indexes, foreign keys, comments, manual-work DDL) without copying a row — useful for reviewing or hand-tweaking the target schema before committing to a long load. `--data-only` then copies data into that existing schema, verifying every table first. Caveat: a full run creates foreign keys *after* the data on purpose; a data-only load runs with any existing constraints active, so it warns when the target already has foreign keys — child rows loading before their parents would fail. When that happens, drop the constraints, load, and restore them.
+- **`--target-tuning`** raises `maintenance_work_mem` to 128MB (pgloader's default) on the migration's PostgreSQL connections, which speeds up the post-copy index builds on large tables. It deliberately does not touch durability settings like `synchronous_commit`, because resume checkpoints assume acknowledged commits survive a target crash. Poolers that reject startup options (PgBouncer) fall back to an untuned connection automatically.
 - **`--workers N`** copies up to N tables concurrently, each on its own MySQL connection with a consistent snapshot, all observing the same point in time. Alignment tries two strategies automatically: a brief `FLUSH TABLES WITH READ LOCK` (milliseconds; needs the `RELOAD` privilege), then — when that is unavailable, as on RDS and most managed MySQL — **lock-free verified alignment**: the binlog position is captured before and after opening the snapshots, and identical positions prove no transaction committed in between (needs `REPLICATION CLIENT`, retried a few times on a busy source). If neither works, pass `--skip-snapshot-lock` to assert the source receives no writes, or run with `--workers 1`. Index creation also parallelizes across tables; foreign keys stay sequential to avoid PostgreSQL lock conflicts. Independent of worker count, every table copy pipelines its MySQL reads with its PostgreSQL writes, so even `--workers 1` is faster than earlier releases. Because workers copy whole tables, wall time can never drop below your largest table's copy time: raise `--workers` when the schema has several similarly sized tables, and leave it at 1 when one table holds most of the data (see [BENCHMARKS.md](BENCHMARKS.md)).
 
 Interrupting a run with Ctrl+C is safe: the migration stops after the current batch, progress stays checkpointed, the interruption is recorded in the session log, and the CLI prints the exact resume command. A second Ctrl+C terminates immediately.
@@ -118,6 +123,8 @@ Store `ENCRYPTION_KEY` in a secret manager or a private `.env` file and keep it 
 - PostgreSQL `COPY` bulk loading with idempotent, conflict-targeted replay after resume
 - Identity/serial synchronization preserving MySQL's next `AUTO_INCREMENT` value
 - Secondary/unique/composite index and single/composite foreign-key migration after data load
+- Table, column, and index comment migration (`COMMENT ON`)
+- Phase control (`--schema-only`/`--data-only`) and user type-mapping overrides (`--cast`)
 - Table selection, dry-run planning, SQLite or PostgreSQL session storage
 - A local HTTP server with a JSON API, live log streaming, and a bundled web UI
 
