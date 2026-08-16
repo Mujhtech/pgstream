@@ -142,3 +142,31 @@ func TestBuildAutoUpdateTriggerSQL(t *testing.T) {
 		}
 	}
 }
+
+func TestForeignKeyTypeFamilyGroupsCompatibleTypes(t *testing.T) {
+	// PostgreSQL creates foreign keys across types sharing a btree operator
+	// family; the validator must not be stricter than PostgreSQL itself.
+	compatible := [][2]string{
+		{"varchar", "bpchar"},
+		{"varchar", "text"},
+		{"bpchar", "text"},
+		{"int8", "int4"},
+		{"int2", "int8"},
+	}
+	for _, pair := range compatible {
+		if foreignKeyTypeFamily(pair[0]) != foreignKeyTypeFamily(pair[1]) {
+			t.Fatalf("%s and %s should be foreign-key compatible", pair[0], pair[1])
+		}
+	}
+	incompatible := [][2]string{
+		{"varchar", "uuid"},
+		{"numeric", "int8"},
+		{"text", "int4"},
+		{"uuid", "bpchar"},
+	}
+	for _, pair := range incompatible {
+		if foreignKeyTypeFamily(pair[0]) == foreignKeyTypeFamily(pair[1]) {
+			t.Fatalf("%s and %s should NOT be foreign-key compatible", pair[0], pair[1])
+		}
+	}
+}

@@ -693,6 +693,21 @@ func (sm *SchemaMigrator) buildForeignKeySQL(fk ForeignKeyInfo, constraintName s
 // type matches the referenced column's, and suggests the explicit cast when
 // the mismatch is the common uuid/varchar split from a staged partial
 // migration.
+// foreignKeyTypeFamily maps udt names PostgreSQL can join within one foreign
+// key — types sharing a btree operator family, like varchar against char(n),
+// or bigint against integer — to a family label, so the validator flags only
+// pairings PostgreSQL itself would reject.
+func foreignKeyTypeFamily(udtName string) string {
+	switch udtName {
+	case "varchar", "bpchar", "text":
+		return "text"
+	case "int2", "int4", "int8":
+		return "integer"
+	default:
+		return udtName
+	}
+}
+
 func (sm *SchemaMigrator) validateForeignKeyColumnTypes(ctx context.Context, fk ForeignKeyInfo) error {
 	columnType := func(table, column string) (string, error) {
 		var udtName string
@@ -718,7 +733,7 @@ func (sm *SchemaMigrator) validateForeignKeyColumnTypes(ctx context.Context, fk 
 		if err != nil {
 			return err
 		}
-		if referencingType == referencedType {
+		if foreignKeyTypeFamily(referencingType) == foreignKeyTypeFamily(referencedType) {
 			continue
 		}
 

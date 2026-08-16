@@ -296,6 +296,13 @@ func (m *Migrator) resolveUUIDConversions(ctx context.Context, tables []string) 
 		return fmt.Errorf("list UUID foreign-key edges: %w", err)
 	}
 	referencesUUID := make(map[string]bool)
+	// anchors marks UUID-shaped columns whose foreign-key peer cannot become
+	// uuid — the peer's type is not UUID-shaped (say varchar(64)) or a cast
+	// rule maps it elsewhere. Converting the anchored side alone would make
+	// the constraint impossible, so its whole group must keep its original
+	// type. A peer explicitly cast to uuid lifts the anchor: both ends land
+	// on uuid.
+	anchors := make(map[string]string)
 	for rows.Next() {
 		var fromTable, fromColumn, toTable, toColumn, fromType, toType string
 		if err := rows.Scan(&fromTable, &fromColumn, &toTable, &toColumn, &fromType, &toType); err != nil {
@@ -305,14 +312,19 @@ func (m *Migrator) resolveUUIDConversions(ctx context.Context, tables []string) 
 		if !selected[strings.ToLower(fromTable)] || !selected[strings.ToLower(toTable)] {
 			continue
 		}
-		if !isUUIDStorageType(fromType) || !isUUIDStorageType(toType) {
-			continue
+		fromCast := m.casts.lookup(fromTable, fromColumn, fromType)
+		toCast := m.casts.lookup(toTable, toColumn, toType)
+		fromConvertible := isUUIDStorageType(fromType) && fromCast == ""
+		toConvertible := isUUIDStorageType(toType) && toCast == ""
+		switch {
+		case fromConvertible && toConvertible:
+			referencesUUID[uuidCacheKey(fromTable, fromColumn)] = true
+			edges = append(edges, edge{from: uuidCacheKey(fromTable, fromColumn), to: uuidCacheKey(toTable, toColumn)})
+		case toConvertible && !strings.EqualFold(fromCast, "uuid"):
+			anchors[uuidCacheKey(toTable, toColumn)] = fmt.Sprintf("%s.%s (%s)", fromTable, fromColumn, fromType)
+		case fromConvertible && !strings.EqualFold(toCast, "uuid"):
+			anchors[uuidCacheKey(fromTable, fromColumn)] = fmt.Sprintf("%s.%s (%s)", toTable, toColumn, toType)
 		}
-		if m.casts.lookup(fromTable, fromColumn, fromType) != "" || m.casts.lookup(toTable, toColumn, toType) != "" {
-			continue
-		}
-		referencesUUID[uuidCacheKey(fromTable, fromColumn)] = true
-		edges = append(edges, edge{from: uuidCacheKey(fromTable, fromColumn), to: uuidCacheKey(toTable, toColumn)})
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -371,8 +383,9 @@ func (m *Migrator) resolveUUIDConversions(ctx context.Context, tables []string) 
 		}
 	}
 
-	// A group converts only when every member is clean; otherwise every
-	// member keeps VARCHAR with a reason naming the dirty column.
+	// A group converts only when every member is clean and no member is
+	// foreign-key-anchored to an inconvertible column; otherwise every
+	// member keeps VARCHAR with a reason naming the blocker.
 	dirtyByRoot := make(map[string]string)
 	for key, cand := range members {
 		if invalid[key] > 0 {
@@ -382,14 +395,26 @@ func (m *Migrator) resolveUUIDConversions(ctx context.Context, tables []string) 
 			}
 		}
 	}
+	anchoredByRoot := make(map[string]string)
+	for key, peer := range anchors {
+		if _, isMember := members[key]; isMember {
+			anchoredByRoot[find(key)] = peer
+		}
+	}
 
 	decisions := make(map[string]uuidDecision, len(members))
 	for key, cand := range members {
 		root := find(key)
 		dirty, groupDirty := dirtyByRoot[root]
+		anchorPeer, groupAnchored := anchoredByRoot[root]
 		switch {
-		case !groupDirty:
+		case !groupDirty && !groupAnchored:
 			decisions[key] = uuidDecision{convert: true}
+		case groupAnchored && invalid[key] == 0:
+			decisions[key] = uuidDecision{convert: false, reason: fmt.Sprintf(
+				"a foreign key connects this key group to %s, whose type cannot become uuid; the whole group keeps its original type so the constraint stays creatable. If every value in that column is a canonical UUID, opt in with --cast '%s=uuid'",
+				anchorPeer, strings.SplitN(anchorPeer, " ", 2)[0],
+			)}
 		case invalid[key] > 0:
 			decisions[key] = uuidDecision{convert: false, reason: fmt.Sprintf(
 				"%d rows contain values that are not canonical UUIDs (inspect with: SELECT %s FROM %s WHERE %s IS NOT NULL AND %s NOT REGEXP '%s' LIMIT 5); keeping the original type",
