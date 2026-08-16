@@ -30,7 +30,7 @@ func TestAesGcmRoundTripAndAuthentication(t *testing.T) {
 		t.Fatalf("unexpected plaintext\nwant: %s\n got: %s", plaintext, decrypted)
 	}
 
-	tampered := tamperLastCharacter(ciphertext)
+	tampered := tamperCiphertext(ciphertext)
 	if _, err := cipher.Decrypt(tampered); err == nil {
 		t.Fatal("expected tampered ciphertext to fail authentication")
 	}
@@ -46,10 +46,14 @@ func TestAesGcmAcceptsBase64EncodedKey(t *testing.T) {
 	}
 }
 
-func tamperLastCharacter(value string) string {
-	replacement := "A"
-	if strings.HasSuffix(value, replacement) {
-		replacement = "B"
+// tamperCiphertext flips a character in the middle of the base64 payload.
+// The final character carries only four data bits plus slack, so changing it
+// can decode to identical bytes; a middle character always alters the bytes.
+func tamperCiphertext(value string) string {
+	position := len(value) - 8
+	replacement := byte('A')
+	if value[position] == replacement {
+		replacement = 'B'
 	}
-	return value[:len(value)-1] + replacement
+	return value[:position] + string(replacement) + value[position+1:]
 }

@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/lib/pq"
 	"github.com/mujhtech/pgstream/internal/storage"
 	"golang.org/x/sync/errgroup"
 )
@@ -456,7 +456,15 @@ func (m *Migrator) bulkCopyPostgres(ctx context.Context, table string, columns [
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.PrepareContext(ctx, pq.CopyInSchema(m.schemaName, table, columns...))
+	// The COPY statement is built with our own identifier quoting;
+	// pq.CopyInSchema was only a query-string builder and is deprecated.
+	quotedCopyColumns := make([]string, len(columns))
+	for i, column := range columns {
+		quotedCopyColumns[i] = quotePostgresIdentifier(column)
+	}
+	copyStatement := fmt.Sprintf("COPY %s.%s (%s) FROM STDIN",
+		quotePostgresIdentifier(m.schemaName), quotePostgresIdentifier(table), strings.Join(quotedCopyColumns, ", "))
+	stmt, err := tx.PrepareContext(ctx, copyStatement)
 	if err != nil {
 		return fmt.Errorf("prepare copy into %s.%s: %w", m.schemaName, table, err)
 	}

@@ -17,7 +17,7 @@ go build -o pgstream ./cmd
 
 Requirements:
 
-- Go 1.24 or newer
+- Go 1.25 or newer
 - Network access from the CLI to the source MySQL and target PostgreSQL servers
 - InnoDB source tables (non-transactional MySQL engines cannot provide the required consistent snapshot)
 - A PostgreSQL role allowed to create the target schema and its objects
