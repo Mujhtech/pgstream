@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -53,11 +55,40 @@ type ViewInfo struct {
 	ViewName string
 }
 
+// ManualStatement is DDL that pgstream generated but deliberately did not
+// execute, together with the reason it needs a human decision.
+type ManualStatement struct {
+	Kind   string `json:"kind"`
+	Table  string `json:"table"`
+	Name   string `json:"name"`
+	SQL    string `json:"sql"`
+	Reason string `json:"reason"`
+}
+
 // SchemaMigrator handles migration of database schema objects
 type SchemaMigrator struct {
 	mysql    *sqlx.DB
 	postgres *sqlx.DB
 	schema   string
+	sink     EventSink
+	manualMu sync.Mutex
+	manual   []ManualStatement
+}
+
+// appendManual records DDL for manual execution; safe from concurrent
+// per-table schema workers.
+func (sm *SchemaMigrator) appendManual(statement ManualStatement) {
+	sm.manualMu.Lock()
+	sm.manual = append(sm.manual, statement)
+	sm.manualMu.Unlock()
+}
+
+// ManualStatements returns the DDL collected for manual execution during
+// schema object migration.
+func (sm *SchemaMigrator) ManualStatements() []ManualStatement {
+	sm.manualMu.Lock()
+	defer sm.manualMu.Unlock()
+	return slices.Clone(sm.manual)
 }
 
 // NewSchemaMigrator creates a new schema migrator
@@ -69,35 +100,9 @@ func NewSchemaMigrator(mysql, postgres *sqlx.DB, schema string) *SchemaMigrator 
 	}
 }
 
-// MigrateAllSchemaObjects migrates all schema objects for a table
-func (sm *SchemaMigrator) MigrateAllSchemaObjects(ctx context.Context, tableName string) error {
-	fmt.Printf("🔧 Starting comprehensive schema migration for table: %s\n", tableName)
-	var migrationErrors []error
-
-	// 1. Migrate indexes
-	if err := sm.migrateIndexes(ctx, tableName); err != nil {
-		migrationErrors = append(migrationErrors, fmt.Errorf("failed to migrate indexes for %s: %w", tableName, err))
-	}
-
-	// 2. Migrate foreign keys
-	if err := sm.migrateForeignKeys(ctx, tableName); err != nil {
-		migrationErrors = append(migrationErrors, fmt.Errorf("failed to migrate foreign keys for %s: %w", tableName, err))
-	}
-
-	// 3. Migrate triggers
-	if err := sm.migrateTriggers(ctx, tableName); err != nil {
-		migrationErrors = append(migrationErrors, fmt.Errorf("failed to migrate triggers for %s: %w", tableName, err))
-	}
-
-	if len(migrationErrors) == 0 {
-		fmt.Printf("✅ Completed schema migration for table: %s\n", tableName)
-	}
-	return errors.Join(migrationErrors...)
-}
-
 // MigrateAllFunctions migrates all functions from MySQL to PostgreSQL
 func (sm *SchemaMigrator) MigrateAllFunctions(ctx context.Context) error {
-	fmt.Printf("🔧 Starting function migration\n")
+	sm.logf("🔧 Starting function migration\n")
 
 	functions, err := sm.getMySQLFunctions(ctx)
 	if err != nil {
@@ -105,7 +110,7 @@ func (sm *SchemaMigrator) MigrateAllFunctions(ctx context.Context) error {
 	}
 
 	for _, function := range functions {
-		fmt.Printf("⚠️  Skipping function %s: automatic MySQL procedural SQL conversion is not yet safe\n", function.FunctionName)
+		sm.warnf("⚠️  Skipping function %s: automatic MySQL procedural SQL conversion is not yet safe\n", function.FunctionName)
 	}
 
 	return nil
@@ -113,7 +118,7 @@ func (sm *SchemaMigrator) MigrateAllFunctions(ctx context.Context) error {
 
 // MigrateAllViews migrates all views from MySQL to PostgreSQL
 func (sm *SchemaMigrator) MigrateAllViews(ctx context.Context) error {
-	fmt.Printf("🔧 Discovering views\n")
+	sm.logf("🔧 Discovering views\n")
 
 	views, err := sm.getMySQLViews(ctx)
 	if err != nil {
@@ -121,7 +126,7 @@ func (sm *SchemaMigrator) MigrateAllViews(ctx context.Context) error {
 	}
 
 	for _, view := range views {
-		fmt.Printf("⚠️  Skipping view %s: automatic MySQL SQL conversion is not yet safe\n", view.ViewName)
+		sm.warnf("⚠️  Skipping view %s: automatic MySQL SQL conversion is not yet safe\n", view.ViewName)
 	}
 	return nil
 }
@@ -242,7 +247,7 @@ func (sm *SchemaMigrator) migrateIndexes(ctx context.Context, tableName string) 
 		}
 
 		if _, err := sm.postgres.ExecContext(ctx, indexSQL); err != nil {
-			fmt.Printf("⚠️  Failed to create index %s: %v\n", index.IndexName, err)
+			sm.warnf("⚠️  Failed to create index %s: %v\n", index.IndexName, err)
 			migrationErrors = append(migrationErrors, fmt.Errorf("create index %s: %w", index.IndexName, err))
 			continue
 		}
@@ -255,7 +260,7 @@ func (sm *SchemaMigrator) migrateIndexes(ctx context.Context, tableName string) 
 			}
 		}
 
-		fmt.Printf("✅ Created index: %s on %s.%s\n", postgresName, sm.schema, tableName)
+		sm.logf("✅ Created index: %s on %s.%s\n", postgresName, sm.schema, tableName)
 	}
 
 	return errors.Join(migrationErrors...)
@@ -406,25 +411,46 @@ func (sm *SchemaMigrator) migrateForeignKeys(ctx context.Context, tableName stri
 	}
 
 	if len(foreignKeys) == 0 {
-		fmt.Printf("ℹ️  No foreign keys found for table: %s\n", tableName)
 		return nil
 	}
 
-	fmt.Printf("🔧 Migrating %d foreign keys for table: %s\n", len(foreignKeys), tableName)
+	sm.logf("🔧 Migrating %d foreign keys for table: %s\n", len(foreignKeys), tableName)
 	var migrationErrors []error
 
 	for _, fk := range foreignKeys {
 		constraintName := boundedPostgresObjectName(fk.ConstraintName, fk.TableName+"\x00"+fk.ConstraintName)
+
+		// A foreign key whose target is missing from the SOURCE database
+		// (a partial backup or restore) is unenforceable anywhere; MySQL
+		// itself only holds it as metadata. Report it for manual work
+		// instead of failing the migration.
+		existsInSource, err := sm.tableExistsInMySQL(ctx, fk.ReferencedTable)
+		if err != nil {
+			migrationErrors = append(migrationErrors, fmt.Errorf("check source table %s: %w", fk.ReferencedTable, err))
+			continue
+		}
+		if !existsInSource {
+			sm.warnf("⚠️  Skipping foreign key %s on %s: referenced table %s does not exist in the source database (partial backup?); its DDL is saved for manual execution after restoring %s", fk.ConstraintName, fk.TableName, fk.ReferencedTable, fk.ReferencedTable)
+			sm.appendManual(ManualStatement{
+				Kind:   "foreign_key",
+				Table:  fk.TableName,
+				Name:   constraintName,
+				SQL:    sm.buildForeignKeySQL(fk, constraintName),
+				Reason: fmt.Sprintf("referenced table %s does not exist in the source database (partial backup); run after restoring and migrating %s", fk.ReferencedTable, fk.ReferencedTable),
+			})
+			continue
+		}
+
 		// Check if the referenced table exists in PostgreSQL
 		referencedTableExists, err := sm.tableExistsInPostgres(ctx, fk.ReferencedTable)
 		if err != nil {
-			fmt.Printf("⚠️  Could not check if referenced table %s exists: %v\n", fk.ReferencedTable, err)
+			sm.warnf("⚠️  Could not check if referenced table %s exists: %v\n", fk.ReferencedTable, err)
 			migrationErrors = append(migrationErrors, fmt.Errorf("check referenced table %s: %w", fk.ReferencedTable, err))
 			continue
 		}
 
 		if !referencedTableExists {
-			fmt.Printf("⚠️  Referenced table %s does not exist, skipping foreign key %s\n", fk.ReferencedTable, fk.ConstraintName)
+			sm.warnf("⚠️  Referenced table %s does not exist, skipping foreign key %s\n", fk.ReferencedTable, fk.ConstraintName)
 			migrationErrors = append(migrationErrors, fmt.Errorf("referenced table %s does not exist for foreign key %s", fk.ReferencedTable, fk.ConstraintName))
 			continue
 		}
@@ -445,39 +471,30 @@ func (sm *SchemaMigrator) migrateForeignKeys(ctx context.Context, tableName stri
 			return fmt.Errorf("check foreign key %s: %w", constraintName, err)
 		}
 		if constraintExists {
-			fmt.Printf("⏭️  Foreign key %s already exists\n", constraintName)
+			sm.logf("⏭️  Foreign key %s already exists\n", constraintName)
 			continue
 		}
 
-		quotedColumns := make([]string, len(fk.ColumnNames))
-		quotedReferencedColumns := make([]string, len(fk.ReferencedColumns))
-		for i, column := range fk.ColumnNames {
-			quotedColumns[i] = quotePostgresIdentifier(column)
-		}
-		for i, column := range fk.ReferencedColumns {
-			quotedReferencedColumns[i] = quotePostgresIdentifier(column)
+		// Incompatible column types make the constraint impossible to
+		// create; surface an actionable error instead of PostgreSQL's
+		// generic one. This typically happens when the referenced table is
+		// restored and migrated after a partial migration already created
+		// the referencing columns with a different type mapping.
+		if err := sm.validateForeignKeyColumnTypes(ctx, fk); err != nil {
+			sm.warnf("⚠️  Cannot create foreign key %s: %v", fk.ConstraintName, err)
+			migrationErrors = append(migrationErrors, fmt.Errorf("foreign key %s: %w", fk.ConstraintName, err))
+			continue
 		}
 
-		// Build foreign key constraint SQL
-		constraintSQL := fmt.Sprintf(`ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)`,
-			quotePostgresIdentifier(sm.schema), quotePostgresIdentifier(fk.TableName), quotePostgresIdentifier(constraintName), strings.Join(quotedColumns, ", "),
-			quotePostgresIdentifier(sm.schema), quotePostgresIdentifier(fk.ReferencedTable), strings.Join(quotedReferencedColumns, ", "))
-
-		// Add ON DELETE and ON UPDATE clauses
-		if fk.OnDelete != "NO ACTION" && fk.OnDelete != "" {
-			constraintSQL += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
-		}
-		if fk.OnUpdate != "NO ACTION" && fk.OnUpdate != "" {
-			constraintSQL += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
-		}
+		constraintSQL := sm.buildForeignKeySQL(fk, constraintName)
 
 		if _, err := sm.postgres.ExecContext(ctx, constraintSQL); err != nil {
-			fmt.Printf("⚠️  Failed to create foreign key %s: %v\n", constraintName, err)
+			sm.warnf("⚠️  Failed to create foreign key %s: %v\n", constraintName, err)
 			migrationErrors = append(migrationErrors, fmt.Errorf("create foreign key %s: %w", constraintName, err))
 			continue
 		}
 
-		fmt.Printf("✅ Created foreign key: %s on %s.%s\n", constraintName, sm.schema, fk.TableName)
+		sm.logf("✅ Created foreign key: %s on %s.%s\n", constraintName, sm.schema, fk.TableName)
 	}
 
 	return errors.Join(migrationErrors...)
@@ -524,7 +541,7 @@ func (sm *SchemaMigrator) migrateTriggers(ctx context.Context, tableName string)
 	}
 
 	for _, trigger := range triggers {
-		fmt.Printf("⚠️  Skipping trigger %s on %s: automatic MySQL procedural SQL conversion is not yet safe\n", trigger.TriggerName, tableName)
+		sm.warnf("⚠️  Skipping trigger %s on %s: automatic MySQL procedural SQL conversion is not yet safe\n", trigger.TriggerName, tableName)
 	}
 
 	return nil
@@ -593,6 +610,174 @@ func (sm *SchemaMigrator) getMySQLViews(ctx context.Context) ([]ViewInfo, error)
 	}
 
 	return views, nil
+}
+
+// buildForeignKeySQL renders the ALTER TABLE statement that creates one
+// foreign key constraint in the target schema.
+func (sm *SchemaMigrator) buildForeignKeySQL(fk ForeignKeyInfo, constraintName string) string {
+	quotedColumns := make([]string, len(fk.ColumnNames))
+	quotedReferencedColumns := make([]string, len(fk.ReferencedColumns))
+	for i, column := range fk.ColumnNames {
+		quotedColumns[i] = quotePostgresIdentifier(column)
+	}
+	for i, column := range fk.ReferencedColumns {
+		quotedReferencedColumns[i] = quotePostgresIdentifier(column)
+	}
+
+	constraintSQL := fmt.Sprintf(`ALTER TABLE %s.%s ADD CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s.%s (%s)`,
+		quotePostgresIdentifier(sm.schema), quotePostgresIdentifier(fk.TableName), quotePostgresIdentifier(constraintName), strings.Join(quotedColumns, ", "),
+		quotePostgresIdentifier(sm.schema), quotePostgresIdentifier(fk.ReferencedTable), strings.Join(quotedReferencedColumns, ", "))
+
+	if fk.OnDelete != "NO ACTION" && fk.OnDelete != "" {
+		constraintSQL += fmt.Sprintf(" ON DELETE %s", fk.OnDelete)
+	}
+	if fk.OnUpdate != "NO ACTION" && fk.OnUpdate != "" {
+		constraintSQL += fmt.Sprintf(" ON UPDATE %s", fk.OnUpdate)
+	}
+	return constraintSQL
+}
+
+// validateForeignKeyColumnTypes checks that each referencing column's target
+// type matches the referenced column's, and suggests the explicit cast when
+// the mismatch is the common uuid/varchar split from a staged partial
+// migration.
+func (sm *SchemaMigrator) validateForeignKeyColumnTypes(ctx context.Context, fk ForeignKeyInfo) error {
+	columnType := func(table, column string) (string, error) {
+		var udtName string
+		err := sm.postgres.QueryRowContext(ctx, `
+			SELECT udt_name FROM information_schema.columns
+			WHERE table_schema = $1 AND table_name = $2 AND LOWER(column_name) = LOWER($3)
+		`, sm.schema, table, column).Scan(&udtName)
+		if err != nil {
+			return "", fmt.Errorf("read type of %s.%s: %w", table, column, err)
+		}
+		return udtName, nil
+	}
+
+	for i := range fk.ColumnNames {
+		if i >= len(fk.ReferencedColumns) {
+			break
+		}
+		referencingType, err := columnType(fk.TableName, fk.ColumnNames[i])
+		if err != nil {
+			return err
+		}
+		referencedType, err := columnType(fk.ReferencedTable, fk.ReferencedColumns[i])
+		if err != nil {
+			return err
+		}
+		if referencingType == referencedType {
+			continue
+		}
+
+		message := fmt.Sprintf(
+			"column %s.%s has type %s but referenced column %s.%s has type %s; this usually means the referenced table was migrated after a partial migration had already created the referencing column",
+			fk.TableName, fk.ColumnNames[i], referencingType,
+			fk.ReferencedTable, fk.ReferencedColumns[i], referencedType,
+		)
+		if (referencingType == "varchar" && referencedType == "uuid") || (referencingType == "uuid" && referencedType == "varchar") {
+			varcharTable, varcharColumn := fk.TableName, fk.ColumnNames[i]
+			if referencingType == "uuid" {
+				varcharTable, varcharColumn = fk.ReferencedTable, fk.ReferencedColumns[i]
+			}
+			message += fmt.Sprintf(
+				`; if every value is a UUID, convert it explicitly with: ALTER TABLE %s.%s ALTER COLUMN %s TYPE uuid USING %s::uuid`,
+				quotePostgresIdentifier(sm.schema), quotePostgresIdentifier(varcharTable),
+				quotePostgresIdentifier(varcharColumn), quotePostgresIdentifier(varcharColumn),
+			)
+		}
+		return errors.New(message)
+	}
+	return nil
+}
+
+// reportAutoUpdateTimestampColumns finds MySQL ON UPDATE CURRENT_TIMESTAMP
+// columns and emits the equivalent PostgreSQL trigger DDL for manual review.
+// The trigger mirrors MySQL's semantics: the timestamp refreshes only when
+// the UPDATE statement did not set the column explicitly.
+func (sm *SchemaMigrator) reportAutoUpdateTimestampColumns(ctx context.Context, tableName string) error {
+	rows, err := sm.mysql.QueryContext(ctx, `
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		AND TABLE_NAME = ?
+		AND LOWER(EXTRA) LIKE '%on update current_timestamp%'
+		ORDER BY ORDINAL_POSITION
+	`, tableName)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return err
+		}
+		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, column := range columns {
+		sm.warnf("⚠️  Column %s.%s uses MySQL ON UPDATE CURRENT_TIMESTAMP; PostgreSQL needs a trigger for that behavior. Its DDL was generated for manual review.", tableName, column)
+		sm.appendManual(ManualStatement{
+			Kind:   "on_update_timestamp",
+			Table:  tableName,
+			Name:   column,
+			SQL:    sm.buildAutoUpdateTriggerSQL(tableName, column),
+			Reason: fmt.Sprintf("MySQL refreshes %s.%s on every UPDATE (ON UPDATE CURRENT_TIMESTAMP); PostgreSQL expresses this with a trigger. Review and run to keep the behavior.", tableName, column),
+		})
+	}
+	return nil
+}
+
+// buildAutoUpdateTriggerSQL renders the trigger function and trigger that
+// reproduce MySQL's ON UPDATE CURRENT_TIMESTAMP for one column.
+func (sm *SchemaMigrator) buildAutoUpdateTriggerSQL(tableName string, column string) string {
+	functionName := hashedPostgresObjectName(
+		fmt.Sprintf("pgstream_%s_%s_on_update_fn", tableName, column),
+		tableName+"\x00"+column+"\x00on_update_fn",
+	)
+	triggerName := hashedPostgresObjectName(
+		fmt.Sprintf("pgstream_%s_%s_on_update", tableName, column),
+		tableName+"\x00"+column+"\x00on_update",
+	)
+	quotedSchema := quotePostgresIdentifier(sm.schema)
+	quotedTable := quotePostgresIdentifier(tableName)
+	quotedColumn := quotePostgresIdentifier(column)
+
+	return fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s.%s() RETURNS trigger LANGUAGE plpgsql AS $pgstream$
+BEGIN
+	IF NEW.%s IS NOT DISTINCT FROM OLD.%s THEN
+		NEW.%s := CURRENT_TIMESTAMP;
+	END IF;
+	RETURN NEW;
+END
+$pgstream$;
+CREATE TRIGGER %s BEFORE UPDATE ON %s.%s FOR EACH ROW EXECUTE FUNCTION %s.%s()`,
+		quotedSchema, quotePostgresIdentifier(functionName),
+		quotedColumn, quotedColumn, quotedColumn,
+		quotePostgresIdentifier(triggerName), quotedSchema, quotedTable,
+		quotedSchema, quotePostgresIdentifier(functionName),
+	)
+}
+
+// tableExistsInMySQL checks if a base table exists in the source database.
+func (sm *SchemaMigrator) tableExistsInMySQL(ctx context.Context, tableName string) (bool, error) {
+	var exists bool
+	err := sm.mysql.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+			WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE'
+		)
+	`, tableName).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if source table %s exists: %w", tableName, err)
+	}
+	return exists, nil
 }
 
 // tableExistsInPostgres checks if a table exists in PostgreSQL

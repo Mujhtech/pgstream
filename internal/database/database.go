@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -38,6 +39,32 @@ func Connect(ctx context.Context, cfg config.Database) (*Database, error) {
 		dbx: dbx,
 		cfg: cfg,
 	}, nil
+}
+
+// ConnectPostgresPreferSSL implements sslmode=prefer semantics for lib/pq,
+// which does not support "prefer" natively: attempt an SSL connection first
+// and fall back to plaintext only when the server has SSL disabled.
+func ConnectPostgresPreferSSL(ctx context.Context, cfg config.Database) (*Database, error) {
+	secure := cfg
+	secure.Options = "sslmode=require&connect_timeout=30"
+	db, err := Connect(ctx, secure)
+	if err == nil {
+		return db, nil
+	}
+	if !isPostgresSSLUnsupported(err) {
+		return nil, err
+	}
+
+	insecure := cfg
+	insecure.Options = "sslmode=disable&connect_timeout=30"
+	return Connect(ctx, insecure)
+}
+
+// isPostgresSSLUnsupported reports whether the connection failed because the
+// server does not speak SSL, which is lib/pq's deterministic response and the
+// only error that justifies a plaintext retry.
+func isPostgresSSLUnsupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "SSL is not enabled on the server")
 }
 
 func (d *Database) GetDB() *sqlx.DB {
@@ -89,6 +116,12 @@ func pingDatabase(ctx context.Context, db *sqlx.DB) error {
 
 		if err == nil {
 			return nil
+		}
+
+		// A server without SSL support answers deterministically; retrying
+		// only delays the caller's plaintext fallback.
+		if isPostgresSSLUnsupported(err) {
+			return err
 		}
 
 		timer := time.NewTimer(time.Second)

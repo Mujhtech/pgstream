@@ -87,3 +87,58 @@ func TestEqualIdentifierListsChecksOrder(t *testing.T) {
 		t.Fatal("primary key column order must be significant")
 	}
 }
+
+func TestBuildForeignKeySQLRendersRulesAndQuoting(t *testing.T) {
+	sm := &SchemaMigrator{schema: "app"}
+	fk := ForeignKeyInfo{
+		ConstraintName:    "fk_orders_customer",
+		TableName:         "orders",
+		ColumnNames:       []string{"customer_id", "region"},
+		ReferencedTable:   "customers",
+		ReferencedColumns: []string{"id", "region"},
+		OnDelete:          "CASCADE",
+		OnUpdate:          "NO ACTION",
+	}
+	got := sm.buildForeignKeySQL(fk, "fk_orders_customer")
+	want := `ALTER TABLE "app"."orders" ADD CONSTRAINT "fk_orders_customer" FOREIGN KEY ("customer_id", "region") REFERENCES "app"."customers" ("id", "region") ON DELETE CASCADE`
+	if got != want {
+		t.Fatalf("unexpected constraint SQL\nwant: %s\n got: %s", want, got)
+	}
+}
+
+func TestBuildColumnDefinitionAcceptsOnUpdateCurrentTimestamp(t *testing.T) {
+	m := &Migrator{schemaName: "app"}
+	def, pgType, err := m.buildColumnDefinition("orders", ColumnInfo{
+		Name:         "updatedAt",
+		Type:         "timestamp",
+		Nullable:     false,
+		HasDefault:   true,
+		DefaultValue: "CURRENT_TIMESTAMP",
+		Extra:        "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+	})
+	if err != nil {
+		t.Fatalf("ON UPDATE CURRENT_TIMESTAMP column must be accepted: %v", err)
+	}
+	if pgType != "TIMESTAMP" {
+		t.Fatalf("unexpected type %q", pgType)
+	}
+	want := `"updatedAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP`
+	if def != want {
+		t.Fatalf("unexpected definition\nwant: %s\n got: %s", want, def)
+	}
+}
+
+func TestBuildAutoUpdateTriggerSQL(t *testing.T) {
+	sm := &SchemaMigrator{schema: "app"}
+	sql := sm.buildAutoUpdateTriggerSQL("orders", "updatedAt")
+	for _, fragment := range []string{
+		`RETURNS trigger`,
+		`IF NEW."updatedAt" IS NOT DISTINCT FROM OLD."updatedAt" THEN`,
+		`NEW."updatedAt" := CURRENT_TIMESTAMP;`,
+		`BEFORE UPDATE ON "app"."orders" FOR EACH ROW`,
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("trigger SQL missing %q:\n%s", fragment, sql)
+		}
+	}
+}

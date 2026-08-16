@@ -6,18 +6,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/mujhtech/pgstream/internal/database"
 	"github.com/mujhtech/pgstream/internal/storage"
-	"github.com/mujhtech/pgstream/internal/utils/views"
+	"golang.org/x/sync/errgroup"
 )
 
 type Migrator struct {
@@ -29,8 +32,20 @@ type Migrator struct {
 	schemaName     string
 	batchSize      int
 	freshSession   bool
+	filter         *tableFilter
+	loadMethod     LoadMethod
+	sink           EventSink
+	workers        int
+	skipSnapLock   bool
 	sourceTx       *sqlx.Tx
+	metadataMu     sync.RWMutex
 	metadataCache  map[string]*tableValidationMetadata
+	uuidCheck      uuidDataCheck
+	zeroDateMu     sync.Mutex
+	zeroDateWarned map[string]bool
+	// rowsCopiedThisRun counts rows loaded by the current Start invocation
+	// across all workers, for run-level throughput reporting.
+	rowsCopiedThisRun atomic.Int64
 }
 
 const defaultBatchSize = 5000
@@ -54,6 +69,69 @@ func WithFreshSession(fresh bool) Option {
 	}
 }
 
+// WithTableFilter restricts the migration to an explicit table subset.
+// Include and exclude selections are mutually exclusive.
+func WithTableFilter(include, exclude []string) Option {
+	return func(migrator *Migrator) error {
+		filter, err := newTableFilter(include, exclude)
+		if err != nil {
+			return err
+		}
+		migrator.filter = filter
+		return nil
+	}
+}
+
+// LoadMethod selects how batches are written to PostgreSQL.
+type LoadMethod string
+
+const (
+	// LoadMethodCopy streams batches through the PostgreSQL COPY protocol.
+	// Batches with replay risk after a resume still use conflict-targeted
+	// inserts, because COPY cannot upsert.
+	LoadMethodCopy LoadMethod = "copy"
+	// LoadMethodInsert uses transactional multi-row INSERT statements only.
+	LoadMethodInsert LoadMethod = "insert"
+)
+
+const maxWorkers = 16
+
+// WithWorkers migrates up to n tables concurrently. Each worker holds its
+// own MySQL connection with a consistent snapshot; snapshots are aligned
+// under a brief FLUSH TABLES WITH READ LOCK (requires the RELOAD or
+// FLUSH_TABLES privilege) unless WithSkipSnapshotLock is set.
+func WithWorkers(n int) Option {
+	return func(migrator *Migrator) error {
+		if n < 1 || n > maxWorkers {
+			return fmt.Errorf("workers must be between 1 and %d", maxWorkers)
+		}
+		migrator.workers = n
+		return nil
+	}
+}
+
+// WithSkipSnapshotLock skips the FLUSH TABLES WITH READ LOCK used to align
+// multi-worker snapshots. Only safe when the source receives no writes
+// during the migration; the caller is asserting that.
+func WithSkipSnapshotLock(skip bool) Option {
+	return func(migrator *Migrator) error {
+		migrator.skipSnapLock = skip
+		return nil
+	}
+}
+
+func WithLoadMethod(method LoadMethod) Option {
+	return func(migrator *Migrator) error {
+		switch method {
+		case LoadMethodCopy, LoadMethodInsert:
+			migrator.loadMethod = method
+			return nil
+		default:
+			return fmt.Errorf("unsupported load method %q; use %q or %q", method, LoadMethodCopy, LoadMethodInsert)
+		}
+	}
+}
+
 type mysqlQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
@@ -71,9 +149,10 @@ type tableValidationMetadata struct {
 	enumValuesByColumn map[string]map[string]struct{}
 }
 
+// New builds a migrator. storage may be nil only for DryRun; Start requires it.
 func New(mysql *database.Database, postgres *database.Database, storage *storage.Storage, sessionId string, options ...Option) (*Migrator, error) {
-	if mysql == nil || postgres == nil || storage == nil {
-		return nil, fmt.Errorf("MySQL, PostgreSQL, and metadata storage connections are required")
+	if mysql == nil || postgres == nil {
+		return nil, fmt.Errorf("MySQL and PostgreSQL connections are required")
 	}
 	if sessionId == "" {
 		return nil, fmt.Errorf("session ID cannot be empty")
@@ -96,6 +175,8 @@ func New(mysql *database.Database, postgres *database.Database, storage *storage
 		schemaMigrator: schemaMigrator,
 		schemaName:     schemaName,
 		batchSize:      defaultBatchSize,
+		loadMethod:     LoadMethodCopy,
+		workers:        1,
 		metadataCache:  make(map[string]*tableValidationMetadata),
 	}
 	for _, option := range options {
@@ -103,11 +184,20 @@ func New(mysql *database.Database, postgres *database.Database, storage *storage
 			return nil, err
 		}
 	}
+	// One serialized sink shared with schema object migration, so parallel
+	// table workers never interleave inside a sink call.
+	migrator.sink = lockedSink(migrator.sink)
+	schemaMigrator.sink = migrator.sink
 	return migrator, nil
 }
 
 func (m *Migrator) Start(ctx context.Context) error {
-	fmt.Println("🚀 Starting MySQL to PostgreSQL migration...")
+	if m.storage == nil {
+		return fmt.Errorf("session metadata storage is required to run a migration")
+	}
+	runStart := time.Now()
+	m.rowsCopiedThisRun.Store(0)
+	m.logf("🚀 Starting MySQL to PostgreSQL migration...")
 
 	// Step 1: Ensure schema exists
 	if err := m.ensureSchemaExists(ctx); err != nil {
@@ -115,23 +205,29 @@ func (m *Migrator) Start(ctx context.Context) error {
 	}
 
 	// Step 2: Get all tables from MySQL
-	tables, err := m.getMySQLTables(ctx)
+	sourceTables, err := m.getMySQLTables(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get MySQL tables: %w", err)
 	}
-	for _, table := range tables {
-		if err := validatePostgresIdentifier(table, "source table name"); err != nil {
-			return err
-		}
+	tables, err := m.selectTables(sourceTables)
+	if err != nil {
+		return err
 	}
 	if err := m.validateSourceForeignKeyScope(ctx); err != nil {
 		return err
 	}
-
-	fmt.Printf("📋 Found %d tables to migrate\n", len(tables))
+	if m.filter.active() {
+		if err := m.validateForeignKeyClosure(ctx, tables); err != nil {
+			return err
+		}
+		m.logf("📋 Selected %d of %d tables to migrate\n", len(tables), len(sourceTables))
+	} else {
+		m.logf("📋 Found %d tables to migrate\n", len(tables))
+	}
 
 	// Step 3: Create all tables in PostgreSQL (structure only)
-	fmt.Println("🏗️  Step 1: Creating table structures...")
+	m.logf("🏗️  Step 1: Creating table structures...")
+	schemaPhaseStart := time.Now()
 	if err := m.createAllTables(ctx, tables); err != nil {
 		return fmt.Errorf("failed to create tables: %w", err)
 	}
@@ -140,32 +236,121 @@ func (m *Migrator) Start(ctx context.Context) error {
 			return fmt.Errorf("validate fresh target: %w", err)
 		}
 	}
+	m.logf("🏗️  Step 1 finished in %s", formatDuration(time.Since(schemaPhaseStart)))
 
 	// Step 4: Migrate data before secondary indexes, foreign keys, and triggers.
 	// This keeps bulk loading fast and prevents target-side behavior from mutating source data.
-	fmt.Println("📦 Step 2: Migrating data...")
-	if err := m.beginSourceSnapshot(ctx); err != nil {
-		return fmt.Errorf("begin consistent MySQL snapshot: %w", err)
+	workers := m.workers
+	if workers > len(tables) {
+		workers = len(tables)
 	}
-	if err := m.migrateAllData(ctx, tables); err != nil {
-		m.rollbackSourceSnapshot()
-		return fmt.Errorf("failed to migrate data: %w", err)
+	dataPhaseStart := time.Now()
+	if workers > 1 {
+		m.logf("📦 Step 2: Migrating data (%d tables, %d workers)...", len(tables), workers)
+		snapshots, err := m.beginAlignedSnapshots(ctx, workers)
+		if err != nil {
+			return fmt.Errorf("begin aligned MySQL snapshots: %w", err)
+		}
+		if err := m.migrateAllDataParallel(ctx, tables, snapshots); err != nil {
+			snapshots.rollback()
+			return fmt.Errorf("failed to migrate data: %w", err)
+		}
+		if err := snapshots.commit(ctx); err != nil {
+			return fmt.Errorf("finish consistent MySQL snapshots: %w", err)
+		}
+	} else {
+		m.logf("📦 Step 2: Migrating data...")
+		if err := m.beginSourceSnapshot(ctx); err != nil {
+			return fmt.Errorf("begin consistent MySQL snapshot: %w", err)
+		}
+		if err := m.migrateAllData(ctx, tables); err != nil {
+			m.rollbackSourceSnapshot()
+			return fmt.Errorf("failed to migrate data: %w", err)
+		}
+		if err := m.commitSourceSnapshot(); err != nil {
+			return fmt.Errorf("finish consistent MySQL snapshot: %w", err)
+		}
 	}
-	if err := m.commitSourceSnapshot(); err != nil {
-		return fmt.Errorf("finish consistent MySQL snapshot: %w", err)
+
+	dataPhase := time.Since(dataPhaseStart)
+	rowsCopied := m.rowsCopiedThisRun.Load()
+	throughput := ""
+	if seconds := dataPhase.Seconds(); seconds > 0 && rowsCopied > 0 {
+		throughput = fmt.Sprintf(", %.0f rows/s", float64(rowsCopied)/seconds)
 	}
+	m.logf("📦 Step 2 finished in %s (%d rows copied this run%s)", formatDuration(dataPhase), rowsCopied, throughput)
 
 	// Step 5: Create schema objects after the data is in place.
-	fmt.Println("🔧 Step 3: Migrating schema objects...")
-	if err := m.migrateAllSchemaObjects(ctx, tables); err != nil {
-		return fmt.Errorf("failed to migrate schema objects: %w", err)
+	m.logf("🔧 Step 3: Migrating schema objects...")
+	indexPhaseStart := time.Now()
+	schemaErr := m.migrateAllSchemaObjects(ctx, tables)
+	// DDL that needs a human decision is persisted even when schema object
+	// migration reported errors.
+	if err := m.writeManualStatements(); err != nil {
+		m.warnf("⚠️  Failed to write manual DDL file: %v", err)
 	}
+	if schemaErr != nil {
+		return fmt.Errorf("failed to migrate schema objects: %w", schemaErr)
+	}
+	m.logf("🔧 Step 3 finished in %s", formatDuration(time.Since(indexPhaseStart)))
 
-	fmt.Println("✅ Migration completed successfully!")
+	m.logf("✅ Migration completed successfully in %s (%d rows copied this run)", formatDuration(time.Since(runStart)), rowsCopied)
 	return nil
 }
 
-func (m *Migrator) sourceQueryer() mysqlQueryer {
+// formatDuration renders run timings at a human scale: milliseconds under a
+// second, tenths of a second under a minute, whole seconds beyond.
+func formatDuration(duration time.Duration) string {
+	switch {
+	case duration < time.Second:
+		return duration.Round(time.Millisecond).String()
+	case duration < time.Minute:
+		return duration.Round(100 * time.Millisecond).String()
+	default:
+		return duration.Round(time.Second).String()
+	}
+}
+
+// writeManualStatements saves DDL that pgstream deliberately skipped (for
+// example foreign keys whose referenced table is missing from a partial
+// backup) so it can be reviewed and applied once the blocker is resolved.
+func (m *Migrator) writeManualStatements() error {
+	statements := m.schemaMigrator.ManualStatements()
+	if len(statements) == 0 {
+		return nil
+	}
+
+	var script strings.Builder
+	script.WriteString("-- pgstream: DDL requiring manual review, session " + m.sessionId + "\n")
+	script.WriteString("-- Each statement was skipped for the stated reason. Review it, resolve\n")
+	script.WriteString("-- the blocker, and run the statement against the target database.\n")
+	script.WriteString("-- Re-running the same pgstream session after restoring missing source\n")
+	script.WriteString("-- tables also retries these constraints automatically.\n\n")
+	for _, statement := range statements {
+		fmt.Fprintf(&script, "-- [%s] %s on %s\n-- reason: %s\n%s;\n\n", statement.Kind, statement.Name, statement.Table, statement.Reason, statement.SQL)
+	}
+
+	fileName := fmt.Sprintf("pgstream-manual-%s.sql", m.sessionId)
+	if err := os.WriteFile(fileName, []byte(script.String()), 0o600); err != nil {
+		return err
+	}
+	m.warnf("⚠️  %d schema objects need manual work; their DDL was written to %s", len(statements), fileName)
+	return nil
+}
+
+// sourceQueryerKey carries a per-worker snapshot connection through the
+// context so concurrently migrating tables each read from their own aligned
+// consistent snapshot.
+type sourceQueryerKey struct{}
+
+func withSourceQueryer(ctx context.Context, queryer mysqlQueryer) context.Context {
+	return context.WithValue(ctx, sourceQueryerKey{}, queryer)
+}
+
+func (m *Migrator) sourceQueryer(ctx context.Context) mysqlQueryer {
+	if queryer, ok := ctx.Value(sourceQueryerKey{}).(mysqlQueryer); ok && queryer != nil {
+		return queryer
+	}
 	if m.sourceTx != nil {
 		return m.sourceTx
 	}
@@ -245,9 +430,9 @@ func (m *Migrator) ensureSchemaExists(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to create schema %s: %w", m.schemaName, err)
 		}
-		fmt.Printf("✅ Created schema: %s\n", m.schemaName)
+		m.logf("✅ Created schema: %s\n", m.schemaName)
 	} else {
-		fmt.Printf("✅ Schema exists: %s\n", m.schemaName)
+		m.logf("✅ Schema exists: %s\n", m.schemaName)
 	}
 
 	return nil
@@ -297,7 +482,7 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 	// InnoDB COUNT(*) scans the whole table. Use its metadata estimate for progress
 	// and let the keyset loop determine when the copy is complete.
 	var estimatedRowCount sql.NullInt64
-	row := m.sourceQueryer().QueryRowContext(ctx, `
+	row := m.sourceQueryer(ctx).QueryRowContext(ctx, `
 		SELECT TABLE_ROWS
 		FROM INFORMATION_SCHEMA.TABLES
 		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
@@ -307,9 +492,7 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 	}
 	rowCount := estimatedRowCount.Int64
 
-	fmt.Println(lipgloss.Place(0, 0, 0, 0,
-		views.BasicLayout.Render(fmt.Sprintf("📦 Migrating table %s (approximately %d rows)...", table, rowCount)),
-	))
+	m.progress(table, 0, rowCount, "📦 Migrating table %s (approximately %d rows)...", table, rowCount)
 
 	// Get current migration state to resume from last offset
 	state, err := m.storage.GetMigration(ctx, m.sessionId, table)
@@ -326,7 +509,7 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 			return fmt.Errorf("decode resume cursor for %s: %w", table, err)
 		}
 		if processedRows > 0 {
-			fmt.Printf("🔄 Resuming migration after %d rows\n", processedRows)
+			m.logf("🔄 Resuming migration after %d rows\n", processedRows)
 		}
 	}
 
@@ -342,7 +525,7 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 		if processedRows > 0 {
 			return fmt.Errorf("table %s has no primary key and cannot be resumed safely after %d rows; start a fresh session against an empty target", table, processedRows)
 		}
-		fmt.Printf("⚠️  Table %s has no primary key; using one streaming source scan with bounded insert batches. This table cannot be resumed after interruption.\n", table)
+		m.warnf("⚠️  Table %s has no primary key; using one streaming source scan with bounded insert batches. This table cannot be resumed after interruption.\n", table)
 		if err := m.migrateKeylessTable(ctx, table, mysqlColumns, mappedColumns, rowCount, batchSize); err != nil {
 			return err
 		}
@@ -352,86 +535,146 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 		return nil
 	}
 
-	for {
-		query, queryArgs, err := buildMySQLBatchQuery(table, mysqlColumns, primaryKeyColumns, cursor, processedRows, batchSize)
-		if err != nil {
-			return fmt.Errorf("build source query for %s: %w", table, err)
+	// A prior interrupted invocation may have committed one batch beyond its
+	// checkpoint, so up to one previous-run batch of rows after the cursor can
+	// already exist in the target and must load through upserts. The previous
+	// run's batch size is recorded in the checkpoint; a legacy checkpoint
+	// without one gets an unbounded replay window. Rows past the window read
+	// strictly beyond anything previously committed and can stream through
+	// COPY.
+	replayWindow := int64(batchSize)
+	if state != nil {
+		if state.BatchSize > 0 {
+			replayWindow = state.BatchSize
+		} else {
+			replayWindow = -1
 		}
-		rows, err := m.sourceQueryer().QueryContext(ctx, query, queryArgs...)
-		if err != nil {
-			return fmt.Errorf("read source batch from %s: %w", table, err)
-		}
+	}
+	loadedThisInvocation := int64(0)
 
-		values := make([][]any, 0, batchSize)
-		for rows.Next() {
-			cols := make([]any, len(mysqlColumns))
-			colPtrs := make([]any, len(mysqlColumns))
-			for i := range cols {
-				colPtrs[i] = &cols[i]
+	// Reader/writer pipeline: the reader pulls the next batch from MySQL
+	// while the writer validates, loads, and checkpoints the previous one.
+	// The unbuffered channel bounds memory to two in-flight batches, and the
+	// single ordered writer preserves the checkpoint and replay-window
+	// invariants exactly as in the sequential path. The reader owns the
+	// source connection and the channel; the writer owns all target and
+	// checkpoint writes.
+	type sourceBatch struct {
+		values     [][]any
+		lastCursor string
+	}
+	batches := make(chan sourceBatch)
+
+	group, groupCtx := errgroup.WithContext(ctx)
+
+	group.Go(func() error {
+		defer close(batches)
+		readCursor := cursor
+		readOffset := processedRows
+		for {
+			query, queryArgs, err := buildMySQLBatchQuery(table, mysqlColumns, primaryKeyColumns, readCursor, readOffset, batchSize)
+			if err != nil {
+				return fmt.Errorf("build source query for %s: %w", table, err)
 			}
-			if err := rows.Scan(colPtrs...); err != nil {
+			rows, err := m.sourceQueryer(groupCtx).QueryContext(groupCtx, query, queryArgs...)
+			if err != nil {
+				return fmt.Errorf("read source batch from %s: %w", table, err)
+			}
+
+			// One arena per batch backs every row's value slice, and the
+			// scan-pointer slice is reused across rows: two allocations per
+			// batch instead of two per row.
+			columnCount := len(mysqlColumns)
+			values := make([][]any, 0, batchSize)
+			arena := make([]any, batchSize*columnCount)
+			colPtrs := make([]any, columnCount)
+			for rows.Next() {
+				var cols []any
+				if next := len(values) * columnCount; next+columnCount <= len(arena) {
+					cols = arena[next : next+columnCount : next+columnCount]
+				} else {
+					cols = make([]any, columnCount)
+				}
+				for i := range cols {
+					colPtrs[i] = &cols[i]
+				}
+				if err := rows.Scan(colPtrs...); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf("scan source row from %s: %w", table, err)
+				}
+				values = append(values, cols)
+			}
+			if err := rows.Err(); err != nil {
 				_ = rows.Close()
-				return fmt.Errorf("scan source row from %s: %w", table, err)
+				return fmt.Errorf("iterate source rows from %s: %w", table, err)
 			}
-			values = append(values, cols)
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("iterate source rows from %s: %w", table, err)
-		}
-		if err := rows.Close(); err != nil {
-			return fmt.Errorf("close source rows for %s: %w", table, err)
-		}
-		if len(values) == 0 {
-			break
-		}
+			if err := rows.Close(); err != nil {
+				return fmt.Errorf("close source rows for %s: %w", table, err)
+			}
+			if len(values) == 0 {
+				return nil
+			}
 
-		// Build INSERT using mapped PostgreSQL column names
-		transformedValues, err := m.validateAndTransformData(ctx, table, mappedColumns, values)
-		if err != nil {
-			return fmt.Errorf("validate/transform data for %s: %w", table, err)
-		}
-
-		if err := m.bulkInsertPostgres(ctx, table, mappedColumns, mappedPrimaryKeyColumns, transformedValues); err != nil {
-			return err
-		}
-
-		processedRows += int64(len(values))
-		lastCursor := ""
-		if len(primaryKeyColumns) > 0 {
-			cursor, err = extractCursor(values[len(values)-1], mysqlColumns, primaryKeyColumns)
+			readCursor, err = extractCursor(values[len(values)-1], mysqlColumns, primaryKeyColumns)
 			if err != nil {
 				return fmt.Errorf("capture resume cursor for %s: %w", table, err)
 			}
-			lastCursor, err = encodeCursor(cursor)
+			encodedCursor, err := encodeCursor(readCursor)
 			if err != nil {
 				return fmt.Errorf("encode resume cursor for %s: %w", table, err)
 			}
-		}
+			readOffset += int64(len(values))
 
-		if err := m.storage.UpsertMigration(ctx, storage.MigrationRecord{
-			SessionId:    m.sessionId,
-			TableName:    table,
-			Status:       "in_progress",
-			LastOffset:   processedRows,
-			LastCursor:   lastCursor,
-			RowCount:     rowCount,
-			ErrorMessage: "",
-		}); err != nil {
-			return fmt.Errorf("checkpoint migration for %s: %w", table, err)
+			select {
+			case batches <- sourceBatch{values: values, lastCursor: encodedCursor}:
+			case <-groupCtx.Done():
+				return groupCtx.Err()
+			}
+			if len(values) < batchSize {
+				return nil
+			}
 		}
+	})
 
-		progress := fmt.Sprintf("%d rows", processedRows)
-		if rowCount > 0 {
-			progress = fmt.Sprintf("%d/~%d rows", processedRows, rowCount)
-		}
-		fmt.Println(lipgloss.Place(0, 0, 0, 0,
-			views.BasicLayout.Render(fmt.Sprintf("✅ Inserted %d rows into %s (progress: %s)", len(values), table, progress)),
-		))
+	group.Go(func() error {
+		for batch := range batches {
+			transformedValues, err := m.validateAndTransformData(groupCtx, table, mappedColumns, batch.values)
+			if err != nil {
+				return fmt.Errorf("validate/transform data for %s: %w", table, err)
+			}
 
-		if len(values) < batchSize {
-			break
+			replayRisk := replayWindow < 0 || loadedThisInvocation < replayWindow
+			if err := m.loadBatch(groupCtx, table, mappedColumns, mappedPrimaryKeyColumns, transformedValues, replayRisk); err != nil {
+				return err
+			}
+			loadedThisInvocation += int64(len(batch.values))
+			processedRows += int64(len(batch.values))
+			m.rowsCopiedThisRun.Add(int64(len(batch.values)))
+
+			if err := m.storage.UpsertMigration(groupCtx, storage.MigrationRecord{
+				SessionId:    m.sessionId,
+				TableName:    table,
+				Status:       "in_progress",
+				LastOffset:   processedRows,
+				LastCursor:   batch.lastCursor,
+				BatchSize:    int64(batchSize),
+				RowCount:     rowCount,
+				ErrorMessage: "",
+			}); err != nil {
+				return fmt.Errorf("checkpoint migration for %s: %w", table, err)
+			}
+
+			progress := fmt.Sprintf("%d rows", processedRows)
+			if rowCount > 0 {
+				progress = fmt.Sprintf("%d/~%d rows", processedRows, rowCount)
+			}
+			m.progress(table, processedRows, rowCount, "✅ Inserted %d rows into %s (progress: %s)", len(batch.values), table, progress)
 		}
+		return nil
+	})
+
+	if err := group.Wait(); err != nil {
+		return err
 	}
 
 	if err := m.syncIdentitySequences(ctx, table); err != nil {
@@ -441,11 +684,20 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 }
 
 func (m *Migrator) migrateKeylessTable(ctx context.Context, table string, mysqlColumns, mappedColumns []string, rowCount int64, batchSize int) error {
+	// Keyless copies cannot deduplicate, so the target must start empty.
+	targetRows, err := m.targetTableRowCount(ctx, table)
+	if err != nil {
+		return fmt.Errorf("inspect keyless target table %s: %w", table, err)
+	}
+	if targetRows != 0 {
+		return fmt.Errorf("keyless table %s already has %d rows in the target; truncate %s.%s and restart its migration", table, targetRows, m.schemaName, table)
+	}
+
 	query, err := buildMySQLStreamingQuery(table, mysqlColumns)
 	if err != nil {
 		return fmt.Errorf("build streaming source query for %s: %w", table, err)
 	}
-	rows, err := m.sourceQueryer().QueryContext(ctx, query)
+	rows, err := m.sourceQueryer(ctx).QueryContext(ctx, query)
 	if err != nil {
 		return fmt.Errorf("stream keyless source table %s: %w", table, err)
 	}
@@ -461,16 +713,20 @@ func (m *Migrator) migrateKeylessTable(ctx context.Context, table string, mysqlC
 		if err != nil {
 			return fmt.Errorf("validate/transform data for %s: %w", table, err)
 		}
-		if err := m.bulkInsertPostgres(ctx, table, mappedColumns, nil, transformedValues); err != nil {
+		// Keyless tables are always verified empty before streaming starts,
+		// so their batches never replay committed rows.
+		if err := m.loadBatch(ctx, table, mappedColumns, nil, transformedValues, false); err != nil {
 			return err
 		}
 		processedRows += int64(len(batch))
+		m.rowsCopiedThisRun.Add(int64(len(batch)))
 		if err := m.storage.UpsertMigration(ctx, storage.MigrationRecord{
 			SessionId:    m.sessionId,
 			TableName:    table,
 			Status:       "in_progress",
 			LastOffset:   processedRows,
 			LastCursor:   "",
+			BatchSize:    int64(batchSize),
 			RowCount:     rowCount,
 			ErrorMessage: "",
 		}); err != nil {
@@ -480,16 +736,23 @@ func (m *Migrator) migrateKeylessTable(ctx context.Context, table string, mysqlC
 		if rowCount > 0 {
 			progress = fmt.Sprintf("%d/~%d rows", processedRows, rowCount)
 		}
-		fmt.Println(lipgloss.Place(0, 0, 0, 0,
-			views.BasicLayout.Render(fmt.Sprintf("✅ Inserted %d rows into %s (progress: %s)", len(batch), table, progress)),
-		))
+		m.progress(table, processedRows, rowCount, "✅ Inserted %d rows into %s (progress: %s)", len(batch), table, progress)
 		batch = batch[:0]
 		return nil
 	}
 
+	// Same arena pattern as the keyed reader: the arena is safe to reuse
+	// after each flush because flush loads the batch synchronously.
+	columnCount := len(mysqlColumns)
+	arena := make([]any, batchSize*columnCount)
+	valuePointers := make([]any, columnCount)
 	for rows.Next() {
-		values := make([]any, len(mysqlColumns))
-		valuePointers := make([]any, len(mysqlColumns))
+		var values []any
+		if next := len(batch) * columnCount; next+columnCount <= len(arena) {
+			values = arena[next : next+columnCount : next+columnCount]
+		} else {
+			values = make([]any, columnCount)
+		}
 		for index := range values {
 			valuePointers[index] = &values[index]
 		}
@@ -501,6 +764,7 @@ func (m *Migrator) migrateKeylessTable(ctx context.Context, table string, mysqlC
 			if err := flush(); err != nil {
 				return err
 			}
+			arena = make([]any, batchSize*columnCount)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -529,7 +793,7 @@ func (m *Migrator) tableExistsInPostgres(ctx context.Context, table string) (boo
 }
 
 func (m *Migrator) getColumnNames(ctx context.Context, table string) ([]string, error) {
-	rows, err := m.sourceQueryer().QueryContext(ctx, fmt.Sprintf("SHOW COLUMNS FROM %s", quoteMySQLIdentifier(table)))
+	rows, err := m.sourceQueryer(ctx).QueryContext(ctx, fmt.Sprintf("SHOW COLUMNS FROM %s", quoteMySQLIdentifier(table)))
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +818,7 @@ func (m *Migrator) getColumnNames(ctx context.Context, table string) ([]string, 
 }
 
 func (m *Migrator) getMySQLPrimaryKeyColumns(ctx context.Context, table string) ([]string, error) {
-	rows, err := m.sourceQueryer().QueryContext(ctx, `
+	rows, err := m.sourceQueryer(ctx).QueryContext(ctx, `
 		SELECT COLUMN_NAME
 		FROM INFORMATION_SCHEMA.STATISTICS
 		WHERE TABLE_SCHEMA = DATABASE()
@@ -676,6 +940,71 @@ func (m *Migrator) bulkInsertPostgres(ctx context.Context, table string, columns
 	return nil
 }
 
+// bulkCopyPostgres loads one batch through the PostgreSQL COPY protocol in a
+// single transaction. COPY cannot resolve conflicts, so callers must only use
+// it for batches that cannot replay already-copied rows.
+func (m *Migrator) bulkCopyPostgres(ctx context.Context, table string, columns []string, data [][]any) error {
+	if len(data) == 0 {
+		return nil
+	}
+	if len(columns) == 0 {
+		return fmt.Errorf("cannot copy into %s.%s without columns", m.schemaName, table)
+	}
+
+	tx, err := m.postgres.GetDB().BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin copy transaction for %s.%s: %w", m.schemaName, table, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.PrepareContext(ctx, pq.CopyInSchema(m.schemaName, table, columns...))
+	if err != nil {
+		return fmt.Errorf("prepare copy into %s.%s: %w", m.schemaName, table, err)
+	}
+
+	for rowIndex, row := range data {
+		if len(row) != len(columns) {
+			_ = stmt.Close()
+			return fmt.Errorf("row %d has %d values for %d columns", rowIndex, len(row), len(columns))
+		}
+		if _, err := stmt.ExecContext(ctx, row...); err != nil {
+			_ = stmt.Close()
+			return fmt.Errorf("buffer copy row %d into %s.%s: %w", rowIndex, m.schemaName, table, err)
+		}
+	}
+
+	result, err := stmt.ExecContext(ctx)
+	if err != nil {
+		_ = stmt.Close()
+		return fmt.Errorf("flush copy into %s.%s: %w", m.schemaName, table, err)
+	}
+	if err := stmt.Close(); err != nil {
+		return fmt.Errorf("close copy statement for %s.%s: %w", m.schemaName, table, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read copied row count for %s.%s: %w", m.schemaName, table, err)
+	}
+	if rowsAffected != int64(len(data)) {
+		return fmt.Errorf("copy into %s.%s wrote %d rows; expected %d", m.schemaName, table, rowsAffected, len(data))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit copy into %s.%s: %w", m.schemaName, table, err)
+	}
+	return nil
+}
+
+// loadBatch writes one validated batch to PostgreSQL. replayRisk marks batches
+// that may contain rows already committed by an interrupted invocation; those
+// must go through conflict-targeted inserts because COPY cannot upsert.
+func (m *Migrator) loadBatch(ctx context.Context, table string, columns, conflictColumns []string, data [][]any, replayRisk bool) error {
+	if m.loadMethod == LoadMethodCopy && !replayRisk {
+		return m.bulkCopyPostgres(ctx, table, columns, data)
+	}
+	return m.bulkInsertPostgres(ctx, table, columns, conflictColumns, data)
+}
+
 func (m *Migrator) syncIdentitySequences(ctx context.Context, table string) error {
 	sourceColumn, sourceNextValue, err := m.getMySQLAutoIncrementMetadata(ctx, table)
 	if err != nil {
@@ -761,7 +1090,7 @@ func (m *Migrator) syncIdentitySequences(ctx context.Context, table string) erro
 func (m *Migrator) getMySQLAutoIncrementMetadata(ctx context.Context, table string) (string, sql.NullInt64, error) {
 	var column string
 	var nextValue sql.NullInt64
-	err := m.sourceQueryer().QueryRowContext(ctx, `
+	err := m.sourceQueryer(ctx).QueryRowContext(ctx, `
 		SELECT column_info.COLUMN_NAME, table_info.AUTO_INCREMENT
 		FROM INFORMATION_SCHEMA.COLUMNS column_info
 		JOIN INFORMATION_SCHEMA.TABLES table_info
@@ -867,11 +1196,11 @@ func (m *Migrator) getPostgresEnumValuesByType(ctx context.Context, enumType str
 }
 
 func (m *Migrator) loadValidationMetadata(ctx context.Context, table string) (*tableValidationMetadata, error) {
-	if m.metadataCache == nil {
-		m.metadataCache = make(map[string]*tableValidationMetadata)
-	}
 	cacheKey := strings.ToLower(m.schemaName + "." + table)
-	if metadata, exists := m.metadataCache[cacheKey]; exists {
+	m.metadataMu.RLock()
+	metadata, exists := m.metadataCache[cacheKey]
+	m.metadataMu.RUnlock()
+	if exists {
 		return metadata, nil
 	}
 	rows, err := m.postgres.GetDB().QueryContext(ctx, `
@@ -922,65 +1251,30 @@ func (m *Migrator) loadValidationMetadata(ctx context.Context, table string) (*t
 		enumValuesByColumn[column] = valueSet
 	}
 
-	metadata := &tableValidationMetadata{
+	metadata = &tableValidationMetadata{
 		columns:            columnInfo,
 		enumValuesByColumn: enumValuesByColumn,
 	}
+	m.metadataMu.Lock()
 	m.metadataCache[cacheKey] = metadata
+	m.metadataMu.Unlock()
 	return metadata, nil
 }
 
+// validateAndTransformData validates a batch and converts values in place.
+// The heavy lifting lives in buildColumnPlans/transformRows: the plan
+// resolves all per-column metadata once, so the per-cell loop performs no
+// map lookups, no case folding, and no string-based type dispatch
+// (benchmarked in hotpath_bench_test.go).
 func (m *Migrator) validateAndTransformData(ctx context.Context, table string, columns []string, data [][]any) ([][]any, error) {
-	metadata, err := m.loadValidationMetadata(ctx, table)
+	plans, err := m.buildColumnPlans(ctx, table, columns)
 	if err != nil {
 		return nil, err
 	}
-
-	// Transform the data
-	transformedData := make([][]any, len(data))
-	for i, row := range data {
-		if len(row) != len(columns) {
-			return nil, fmt.Errorf("row %d has %d values for %d columns", i, len(row), len(columns))
-		}
-		transformedRow := make([]any, len(row))
-		copy(transformedRow, row)
-
-		for j, value := range row {
-			columnKey := strings.ToLower(columns[j])
-			info, exists := metadata.columns[columnKey]
-			if !exists {
-				return nil, fmt.Errorf("PostgreSQL column metadata not found for %s.%s", table, columns[j])
-			}
-			if value == nil {
-				if !info.isNullable {
-					return nil, fmt.Errorf("row %d column %s.%s is NULL but the target column is NOT NULL", i, table, info.name)
-				}
-				continue
-			}
-
-			if m.isEnumColumn(info.dataType, info.udtName) {
-				strValue, ok := stringValue(value)
-				if !ok {
-					return nil, fmt.Errorf("enum column %s.%s has unsupported value type %T", table, info.name, value)
-				}
-				if _, valid := metadata.enumValuesByColumn[columnKey][strValue]; valid {
-					transformedRow[j] = strValue
-					continue
-				}
-				return nil, fmt.Errorf("enum column %s.%s contains invalid value %q", table, info.name, strValue)
-			}
-
-			transformedValue, err := m.validateAndTransformValue(value, info.dataType)
-			if err != nil {
-				return nil, fmt.Errorf("row %d column %s.%s: %w", i, table, info.name, err)
-			}
-			transformedRow[j] = transformedValue
-		}
-
-		transformedData[i] = transformedRow
+	if err := m.transformRows(table, plans, data); err != nil {
+		return nil, err
 	}
-
-	return transformedData, nil
+	return data, nil
 }
 
 func stringValue(value any) (string, bool) {
@@ -1212,15 +1506,11 @@ func (m *Migrator) isValidNumeric(value string) bool {
 
 func (m *Migrator) createTableInPostgres(ctx context.Context, table string) error {
 
-	fmt.Printf("🔍 Creating table %s in schema %s\n", table, m.schemaName)
-
 	// Get MySQL table structure
 	mysqlColumns, err := m.getMySQLTableStructure(ctx, table)
 	if err != nil {
 		return fmt.Errorf("failed to get MySQL table structure: %w", err)
 	}
-
-	fmt.Printf("🔍 Found %d columns in MySQL table\n", len(mysqlColumns))
 
 	// Create enum types first if needed
 	err = m.createEnumTypes(ctx, table, mysqlColumns)
@@ -1243,7 +1533,7 @@ func (m *Migrator) createTableInPostgres(ctx context.Context, table string) erro
 		return fmt.Errorf("failed to create primary key for %s: %w", table, err)
 	}
 
-	fmt.Printf("✅ Created table %s.%s\n", m.schemaName, table)
+	m.logf("✅ Created table %s.%s (%d columns)\n", m.schemaName, table, len(mysqlColumns))
 	return nil
 }
 
@@ -1344,36 +1634,118 @@ func equalIdentifierLists(left, right []string) bool {
 }
 
 func (m *Migrator) createEnumTypes(ctx context.Context, table string, columns []ColumnInfo) error {
-
-	fmt.Printf("🔍 Creating enum types for table %s in schema %s\n", table, m.schemaName)
-
+	type enumColumn struct {
+		name   string
+		values []string
+	}
+	var enums []enumColumn
 	for _, col := range columns {
-		// fmt.Printf("🔍 Checking column %s with type: %s\n", col.Name, col.Type)
-		// fmt.Printf("🔍 Contains 'enum': %v\n", strings.Contains(strings.ToLower(col.Type), "enum"))
-
 		if strings.Contains(strings.ToLower(col.Type), "enum") {
-			// Extract enum values from MySQL enum definition
-			enumValues := m.extractEnumValues(col.Type)
-			fmt.Printf("🔍 Extracted enum values for %s: %v\n", col.Name, enumValues)
+			enums = append(enums, enumColumn{name: col.Name, values: m.extractEnumValues(col.Type)})
+		}
+	}
+	if len(enums) == 0 {
+		return nil
+	}
 
-			if len(enumValues) > 0 {
-				// Create the enum type
-				enumTypeName := postgresEnumTypeName(table, col.Name)
-				fmt.Printf("🔍 Creating enum type: %s.%s\n", m.schemaName, enumTypeName)
+	// Non-strict MySQL stores invalid enum inserts as the special
+	// empty-string value. If the data contains it, mirror it as a real ''
+	// label so every row copies losslessly.
+	names := make([]string, len(enums))
+	for i, enum := range enums {
+		names[i] = enum.name
+	}
+	markerCounts, err := m.sourceEnumEmptyMarkerCounts(ctx, table, names)
+	if err != nil {
+		return fmt.Errorf("inspect enum columns of %s for the empty-string marker: %w", table, err)
+	}
 
-				err := m.createPostgresEnumType(ctx, enumTypeName, enumValues)
-				if err != nil {
-					return fmt.Errorf("failed to create enum type %s: %w", enumTypeName, err)
-				}
-				fmt.Printf("✅ Created enum type %s with values: %v\n", enumTypeName, enumValues)
-			} else {
-				fmt.Printf("⚠️  No enum values extracted for column %s\n", col.Name)
+	for _, enum := range enums {
+		enumValues := enum.values
+		if markerCounts[enum.name] > 0 && !slices.Contains(enumValues, "") {
+			m.warnf("⚠️  Column %s.%s has %d rows holding MySQL's empty-string invalid-enum marker (find them with: SELECT * FROM %s WHERE %s = ''); adding '' to the PostgreSQL enum type so the data copies losslessly. Clean these rows up after migration.", table, enum.name, markerCounts[enum.name], quoteMySQLIdentifier(table), quoteMySQLIdentifier(enum.name))
+			enumValues = append([]string{""}, enumValues...)
+		}
+
+		if len(enumValues) > 0 {
+			enumTypeName := postgresEnumTypeName(table, enum.name)
+			if err := m.createPostgresEnumType(ctx, enumTypeName, enumValues); err != nil {
+				return fmt.Errorf("failed to create enum type %s: %w", enumTypeName, err)
 			}
 		} else {
-			fmt.Printf("ℹ️  Column %s is not an enum (type: %s)\n", col.Name, col.Type)
+			m.warnf("⚠️  No enum values extracted for column %s\n", enum.name)
 		}
 	}
 	return nil
+}
+
+// sourceEnumEmptyMarkerCounts counts rows holding MySQL's empty-string
+// marker for invalid enum values (internal index 0, stored when an invalid
+// value was inserted outside strict SQL mode or an ALTER removed a member).
+// All requested columns are counted in one table scan instead of one full
+// scan per column.
+func (m *Migrator) sourceEnumEmptyMarkerCounts(ctx context.Context, table string, columns []string) (map[string]int64, error) {
+	if len(columns) == 0 {
+		return nil, nil
+	}
+	selects := make([]string, len(columns))
+	for i, column := range columns {
+		selects[i] = fmt.Sprintf("COALESCE(SUM(%s = ''), 0)", quoteMySQLIdentifier(column))
+	}
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selects, ", "), quoteMySQLIdentifier(table))
+
+	counts := make([]int64, len(columns))
+	dests := make([]any, len(columns))
+	for i := range counts {
+		dests[i] = &counts[i]
+	}
+	if err := m.sourceQueryer(ctx).QueryRowContext(ctx, query).Scan(dests...); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]int64, len(columns))
+	for i, column := range columns {
+		result[column] = counts[i]
+	}
+	return result, nil
+}
+
+// sourceZeroDateCounts counts, in one table scan, the rows of each temporal
+// column that hold MySQL's zero date. CAST keeps the comparison valid under
+// any session sql_mode.
+func (m *Migrator) sourceZeroDateCounts(ctx context.Context, table string, columns []ColumnInfo) (map[string]int64, error) {
+	var temporal []string
+	for _, col := range columns {
+		lower := strings.ToLower(col.Type)
+		if strings.HasPrefix(lower, "date") || strings.HasPrefix(lower, "datetime") || strings.HasPrefix(lower, "timestamp") {
+			temporal = append(temporal, col.Name)
+		}
+	}
+	if len(temporal) == 0 {
+		return nil, nil
+	}
+
+	selects := make([]string, len(temporal))
+	for i, column := range temporal {
+		quoted := quoteMySQLIdentifier(column)
+		selects[i] = fmt.Sprintf("COALESCE(SUM(CAST(%s AS CHAR) LIKE '0000-00-00%%'), 0)", quoted)
+	}
+	query := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selects, ", "), quoteMySQLIdentifier(table))
+
+	counts := make([]int64, len(temporal))
+	dests := make([]any, len(temporal))
+	for i := range counts {
+		dests[i] = &counts[i]
+	}
+	if err := m.sourceQueryer(ctx).QueryRowContext(ctx, query).Scan(dests...); err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]int64, len(temporal))
+	for i, column := range temporal {
+		result[column] = counts[i]
+	}
+	return result, nil
 }
 
 func (m *Migrator) extractEnumValues(mysqlEnumType string) []string {
@@ -1429,8 +1801,6 @@ func (m *Migrator) extractEnumValues(mysqlEnumType string) []string {
 
 func (m *Migrator) createPostgresEnumType(ctx context.Context, enumTypeName string, values []string) error {
 
-	fmt.Printf("🔍 Creating enum type %s.%s with values: %v\n", m.schemaName, enumTypeName, values)
-
 	// Check if enum type already exists
 	var exists bool
 	err := m.postgres.GetDB().QueryRowContext(ctx, `
@@ -1454,7 +1824,7 @@ func (m *Migrator) createPostgresEnumType(ctx context.Context, enumTypeName stri
 		if !slices.Equal(existingValues, values) {
 			return fmt.Errorf("existing enum type %s has values %v; source requires %v", enumTypeName, existingValues, values)
 		}
-		fmt.Printf("ℹ️  Enum type %s already exists with matching values\n", enumTypeName)
+		m.logf("ℹ️  Enum type %s already exists with matching values\n", enumTypeName)
 		return nil
 	}
 
@@ -1467,19 +1837,18 @@ func (m *Migrator) createPostgresEnumType(ctx context.Context, enumTypeName stri
 
 	// Create the enum type
 	createEnumSQL := fmt.Sprintf(`CREATE TYPE %s.%s AS ENUM (%s)`, quotePostgresIdentifier(m.schemaName), quotePostgresIdentifier(enumTypeName), valuesStr)
-	fmt.Printf("🔍 Executing SQL: %s\n", createEnumSQL)
 
 	_, err = m.postgres.GetDB().ExecContext(ctx, createEnumSQL)
 	if err != nil {
 		return fmt.Errorf("failed to create enum type %s: %w", enumTypeName, err)
 	}
 
-	fmt.Printf("✅ Successfully created enum type %s.%s\n", m.schemaName, enumTypeName)
+	m.logf("✅ Created enum type %s.%s (%s)\n", m.schemaName, enumTypeName, valuesStr)
 	return nil
 }
 
 func (m *Migrator) getMySQLTableStructure(ctx context.Context, table string) ([]ColumnInfo, error) {
-	rows, err := m.sourceQueryer().QueryContext(ctx, `
+	rows, err := m.sourceQueryer(ctx).QueryContext(ctx, `
 		SELECT
 			column_info.COLUMN_NAME,
 			column_info.COLUMN_TYPE,
@@ -1487,6 +1856,7 @@ func (m *Migrator) getMySQLTableStructure(ctx context.Context, table string) ([]
 			column_info.COLUMN_DEFAULT,
 			column_info.EXTRA,
 			column_info.COLUMN_KEY,
+			column_info.GENERATION_EXPRESSION,
 			EXISTS(
 				SELECT 1
 				FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE key_info
@@ -1518,13 +1888,14 @@ func (m *Migrator) getMySQLTableStructure(ctx context.Context, table string) ([]
 		var column ColumnInfo
 		var nullable, columnKey string
 		var referencesUUID bool
-		var defaultValue sql.NullString
-		if err := rows.Scan(&column.Name, &column.Type, &nullable, &defaultValue, &column.Extra, &columnKey, &referencesUUID); err != nil {
+		var defaultValue, generationExpression sql.NullString
+		if err := rows.Scan(&column.Name, &column.Type, &nullable, &defaultValue, &column.Extra, &columnKey, &generationExpression, &referencesUUID); err != nil {
 			return nil, err
 		}
 		column.Nullable = nullable == "YES"
 		column.HasDefault = defaultValue.Valid
 		column.DefaultValue = defaultValue.String
+		column.GenerationExpression = generationExpression.String
 		column.IsUUID = isUUIDStorageType(column.Type) && (columnKey == "PRI" || referencesUUID)
 		if err := validatePostgresIdentifier(column.Name, "source column name"); err != nil {
 			return nil, fmt.Errorf("table %s: %w", table, err)
@@ -1537,6 +1908,12 @@ func (m *Migrator) getMySQLTableStructure(ctx context.Context, table string) ([]
 	if len(columns) == 0 {
 		return nil, fmt.Errorf("table %q has no columns or does not exist", table)
 	}
+	// UUID conversion is a schema-shape heuristic; the data decides whether
+	// it is actually safe. Columns whose values cannot convert keep their
+	// original lossless type.
+	if err := m.applyUUIDDataCheck(ctx, table, columns); err != nil {
+		return nil, err
+	}
 	return columns, nil
 }
 
@@ -1548,6 +1925,21 @@ type ColumnInfo struct {
 	DefaultValue string
 	Extra        string
 	IsUUID       bool
+	// GenerationExpression holds the MySQL expression for VIRTUAL/STORED
+	// generated columns. It is reported for manual translation; the column
+	// itself migrates as a plain column carrying the computed values.
+	GenerationExpression string
+	// UUIDDemotionReason is set when the column matched the UUID storage
+	// shape but its data (or its referenced column's data) cannot convert,
+	// so it keeps its original type.
+	UUIDDemotionReason string
+}
+
+// isGeneratedColumn reports whether EXTRA marks a MySQL VIRTUAL or STORED
+// generated column (as opposed to DEFAULT_GENERATED expression defaults).
+func isGeneratedColumn(extra string) bool {
+	lower := strings.ToLower(extra)
+	return strings.Contains(lower, "virtual generated") || strings.Contains(lower, "stored generated")
 }
 
 func (m *Migrator) parseCreateTableStatement(createStatement string) ([]ColumnInfo, error) {
@@ -1725,47 +2117,64 @@ func (m *Migrator) buildCreateTableSQL(table string, columns []ColumnInfo) (stri
 
 	var columnDefs []string
 	for _, col := range columns {
-		// Convert MySQL type to PostgreSQL type
-		pgType, err := m.convertMySQLTypeToPostgres(col.Type, col.Name, table)
+		def, _, err := m.buildColumnDefinition(table, col)
 		if err != nil {
-			return "", fmt.Errorf("column %s: %w", col.Name, err)
+			return "", err
 		}
-		if col.IsUUID {
-			pgType = "UUID"
-		}
-
-		// Build column definition
-		def := fmt.Sprintf(`%s %s`, quotePostgresIdentifier(col.Name), pgType)
-
-		if !col.Nullable {
-			def += " NOT NULL"
-		}
-
-		extra := strings.ToLower(col.Extra)
-		if strings.Contains(extra, "on update") {
-			return "", fmt.Errorf("column %s uses unsupported MySQL ON UPDATE behavior", col.Name)
-		}
-		if strings.Contains(extra, "generated") && !strings.Contains(extra, "default_generated") {
-			return "", fmt.Errorf("column %s is a generated column; its generation expression cannot be migrated safely", col.Name)
-		}
-		if strings.Contains(extra, "auto_increment") {
-			if !isPostgresIntegerType(pgType) {
-				return "", fmt.Errorf("AUTO_INCREMENT column %s maps to %s, which cannot use a PostgreSQL identity sequence safely", col.Name, pgType)
-			}
-			def += " GENERATED BY DEFAULT AS IDENTITY"
-		} else if col.HasDefault {
-			defaultValue, err := postgresDefaultValue(col.DefaultValue, pgType, col.Extra)
-			if err != nil {
-				return "", fmt.Errorf("column %s default: %w", col.Name, err)
-			}
-			def += " DEFAULT " + defaultValue
-		}
-
 		columnDefs = append(columnDefs, def)
 	}
 
 	return fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (%s)`,
 		quotePostgresIdentifier(m.schemaName), quotePostgresIdentifier(table), strings.Join(columnDefs, ", ")), nil
+}
+
+// buildColumnDefinition converts one MySQL column into its PostgreSQL column
+// definition, returning the resolved PostgreSQL type alongside the DDL
+// fragment.
+func (m *Migrator) buildColumnDefinition(table string, col ColumnInfo) (string, string, error) {
+	pgType, err := m.convertMySQLTypeToPostgres(col.Type, col.Name, table)
+	if err != nil {
+		return "", "", fmt.Errorf("column %s: %w", col.Name, err)
+	}
+	if col.IsUUID {
+		pgType = "UUID"
+	}
+
+	def := fmt.Sprintf(`%s %s`, quotePostgresIdentifier(col.Name), pgType)
+
+	if !col.Nullable {
+		def += " NOT NULL"
+	}
+
+	extra := strings.ToLower(col.Extra)
+	// ON UPDATE CURRENT_TIMESTAMP (the only ON UPDATE MySQL supports) has no
+	// PostgreSQL column equivalent; the column itself migrates normally and
+	// the auto-update behavior is emitted as trigger DDL for manual review
+	// during schema object migration.
+	if strings.Contains(extra, "on update") && !strings.Contains(extra, "on update current_timestamp") {
+		return "", pgType, fmt.Errorf("column %s uses unsupported MySQL ON UPDATE behavior %q", col.Name, col.Extra)
+	}
+	// VIRTUAL/STORED generated columns become plain columns carrying the
+	// values MySQL had computed at snapshot time; the untranslatable
+	// generation expression is reported as manual work during schema object
+	// migration. Their MySQL defaults never apply, so stop here.
+	if isGeneratedColumn(extra) {
+		return def, pgType, nil
+	}
+	if strings.Contains(extra, "auto_increment") {
+		if !isPostgresIntegerType(pgType) {
+			return "", pgType, fmt.Errorf("AUTO_INCREMENT column %s maps to %s, which cannot use a PostgreSQL identity sequence safely", col.Name, pgType)
+		}
+		def += " GENERATED BY DEFAULT AS IDENTITY"
+	} else if col.HasDefault {
+		defaultValue, err := postgresDefaultValue(col.DefaultValue, pgType, col.Extra)
+		if err != nil {
+			return "", pgType, fmt.Errorf("column %s default: %w", col.Name, err)
+		}
+		def += " DEFAULT " + defaultValue
+	}
+
+	return def, pgType, nil
 }
 
 func isPostgresIntegerType(postgresType string) bool {
@@ -1920,9 +2329,16 @@ func postgresPrimaryKeyName(tableName string) string {
 	return hashedPostgresObjectName(tableName+"_pkey", tableName+"\x00pkey")
 }
 
-// getMySQLTables retrieves all table names from MySQL
-func (m *Migrator) getMySQLTables(ctx context.Context) ([]string, error) {
-	rows, err := m.sourceQueryer().QueryContext(ctx, `
+type sourceTable struct {
+	name   string
+	engine string
+}
+
+// getMySQLTables retrieves all base table names and storage engines from MySQL.
+// Engine validation happens in selectTables so that excluded tables may use
+// any storage engine.
+func (m *Migrator) getMySQLTables(ctx context.Context) ([]sourceTable, error) {
+	rows, err := m.sourceQueryer(ctx).QueryContext(ctx, `
 		SELECT TABLE_NAME, ENGINE
 		FROM INFORMATION_SCHEMA.TABLES
 		WHERE TABLE_SCHEMA = DATABASE()
@@ -1934,17 +2350,14 @@ func (m *Migrator) getMySQLTables(ctx context.Context) ([]string, error) {
 	}
 	defer rows.Close()
 
-	var tables []string
+	var tables []sourceTable
 	for rows.Next() {
 		var tableName string
 		var engine sql.NullString
 		if err := rows.Scan(&tableName, &engine); err != nil {
 			return nil, fmt.Errorf("failed to scan table name: %w", err)
 		}
-		if !engine.Valid || !strings.EqualFold(engine.String, "InnoDB") {
-			return nil, fmt.Errorf("source table %s uses storage engine %q; a consistent resumable snapshot currently requires InnoDB", tableName, engine.String)
-		}
-		tables = append(tables, tableName)
+		tables = append(tables, sourceTable{name: tableName, engine: engine.String})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate MySQL tables: %w", err)
@@ -1952,29 +2365,67 @@ func (m *Migrator) getMySQLTables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
+// selectTables applies the configured table filter and validates only the
+// tables that will actually be migrated.
+func (m *Migrator) selectTables(sourceTables []sourceTable) ([]string, error) {
+	names := make([]string, len(sourceTables))
+	enginesByName := make(map[string]string, len(sourceTables))
+	for i, table := range sourceTables {
+		names[i] = table.name
+		enginesByName[strings.ToLower(table.name)] = table.engine
+	}
+
+	tables, err := m.filter.apply(names)
+	if err != nil {
+		return nil, err
+	}
+	for _, table := range tables {
+		if err := validatePostgresIdentifier(table, "source table name"); err != nil {
+			return nil, err
+		}
+		engine := enginesByName[strings.ToLower(table)]
+		if !strings.EqualFold(engine, "InnoDB") {
+			return nil, fmt.Errorf("source table %s uses storage engine %q; a consistent resumable snapshot currently requires InnoDB", table, engine)
+		}
+	}
+	return tables, nil
+}
+
 func (m *Migrator) validateSourceForeignKeyScope(ctx context.Context) error {
-	var tableName, constraintName, referencedSchema string
-	err := m.sourceQueryer().QueryRowContext(ctx, `
+	rows, err := m.sourceQueryer(ctx).QueryContext(ctx, `
 		SELECT TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA
 		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
 		WHERE TABLE_SCHEMA = DATABASE()
 		AND REFERENCED_TABLE_SCHEMA IS NOT NULL
 		AND REFERENCED_TABLE_SCHEMA <> DATABASE()
-		LIMIT 1
-	`).Scan(&tableName, &constraintName, &referencedSchema)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
+	`)
 	if err != nil {
 		return fmt.Errorf("inspect cross-database foreign keys: %w", err)
 	}
-	return fmt.Errorf("foreign key %s on table %s references MySQL database %s; cross-database references cannot be mapped safely into one target schema", constraintName, tableName, referencedSchema)
+	defer rows.Close()
+
+	for rows.Next() {
+		var tableName, constraintName, referencedSchema string
+		if err := rows.Scan(&tableName, &constraintName, &referencedSchema); err != nil {
+			return fmt.Errorf("scan cross-database foreign key metadata: %w", err)
+		}
+		// Cross-database references only block the migration when the
+		// dependent table is actually selected.
+		if !m.filter.selects(tableName) {
+			continue
+		}
+		return fmt.Errorf("foreign key %s on table %s references MySQL database %s; cross-database references cannot be mapped safely into one target schema", constraintName, tableName, referencedSchema)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate cross-database foreign keys: %w", err)
+	}
+	return nil
 }
 
 // createAllTables creates all tables in PostgreSQL (structure only, no data)
 func (m *Migrator) createAllTables(ctx context.Context, tables []string) error {
 	for i, table := range tables {
-		fmt.Printf("🏗️  Creating table %d/%d: %s\n", i+1, len(tables), table)
+		m.logf("🏗️  Creating table %d/%d: %s\n", i+1, len(tables), table)
 
 		// Check if table already exists
 		exists, err := m.tableExistsInPostgres(ctx, table)
@@ -1995,7 +2446,7 @@ func (m *Migrator) createAllTables(ctx context.Context, tables []string) error {
 			if err := m.ensurePrimaryKey(ctx, table); err != nil {
 				return fmt.Errorf("failed to ensure primary key for %s: %w", table, err)
 			}
-			fmt.Printf("⏭️  Table %s already exists, verified primary key\n", table)
+			m.logf("⏭️  Table %s already exists, verified primary key\n", table)
 			continue
 		}
 
@@ -2003,8 +2454,6 @@ func (m *Migrator) createAllTables(ctx context.Context, tables []string) error {
 		if err := m.createTableInPostgres(ctx, table); err != nil {
 			return fmt.Errorf("failed to create table %s: %w", table, err)
 		}
-
-		fmt.Printf("✅ Created table: %s\n", table)
 	}
 
 	return nil
@@ -2012,28 +2461,63 @@ func (m *Migrator) createAllTables(ctx context.Context, tables []string) error {
 
 // migrateAllSchemaObjects migrates all schema objects (indexes, foreign keys, triggers, functions, views)
 func (m *Migrator) migrateAllSchemaObjects(ctx context.Context, tables []string) error {
-	fmt.Println("🔧 Migrating indexes and foreign keys for all tables...")
+	m.logf("🔧 Migrating indexes and foreign keys for all tables...")
 	var migrationErrors []error
 
-	// Migrate schema objects for each table
-	for i, table := range tables {
-		fmt.Printf("🔧 Migrating schema objects for table %d/%d: %s\n", i+1, len(tables), table)
+	var errMu sync.Mutex
+	collect := func(err error) {
+		m.warnf("⚠️  %v\n", err)
+		errMu.Lock()
+		migrationErrors = append(migrationErrors, err)
+		errMu.Unlock()
+	}
 
-		if err := m.schemaMigrator.MigrateAllSchemaObjects(ctx, table); err != nil {
-			fmt.Printf("⚠️  Failed to migrate schema objects for table %s: %v\n", table, err)
-			migrationErrors = append(migrationErrors, err)
+	// Index creation dominates this phase and is safe to parallelize across
+	// distinct tables, unlike foreign keys (concurrent ALTER TABLE on shared
+	// referenced tables can deadlock). Errors are collected, not fail-fast,
+	// matching the sequential behavior.
+	indexGroup := &errgroup.Group{}
+	indexGroup.SetLimit(max(m.workers, 1))
+	for _, table := range tables {
+		indexGroup.Go(func() error {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err := m.schemaMigrator.migrateIndexes(ctx, table); err != nil {
+				collect(fmt.Errorf("failed to migrate indexes for %s: %w", table, err))
+			}
+			if err := m.schemaMigrator.migrateTriggers(ctx, table); err != nil {
+				collect(fmt.Errorf("failed to migrate triggers for %s: %w", table, err))
+			}
+			if err := m.schemaMigrator.reportAutoUpdateTimestampColumns(ctx, table); err != nil {
+				collect(fmt.Errorf("failed to inspect auto-update timestamp columns for %s: %w", table, err))
+			}
+			if err := m.reportGeneratedColumns(ctx, table); err != nil {
+				collect(fmt.Errorf("failed to inspect generated columns for %s: %w", table, err))
+			}
+			return nil
+		})
+	}
+	_ = indexGroup.Wait()
+
+	// Foreign keys run sequentially: two concurrent ALTER TABLE ... ADD
+	// CONSTRAINT statements referencing the same table can deadlock in
+	// PostgreSQL.
+	for _, table := range tables {
+		if err := m.schemaMigrator.migrateForeignKeys(ctx, table); err != nil {
+			collect(fmt.Errorf("failed to migrate foreign keys for %s: %w", table, err))
 		}
 	}
 
 	// Migrate global objects (functions, views)
-	fmt.Println("🔧 Migrating global schema objects (functions, views)...")
+	m.logf("🔧 Migrating global schema objects (functions, views)...")
 	if err := m.schemaMigrator.MigrateAllFunctions(ctx); err != nil {
-		fmt.Printf("⚠️  Failed to migrate functions: %v\n", err)
+		m.warnf("⚠️  Failed to migrate functions: %v\n", err)
 		migrationErrors = append(migrationErrors, err)
 	}
 
 	if err := m.schemaMigrator.MigrateAllViews(ctx); err != nil {
-		fmt.Printf("⚠️  Failed to migrate views: %v\n", err)
+		m.warnf("⚠️  Failed to migrate views: %v\n", err)
 		migrationErrors = append(migrationErrors, err)
 	}
 
@@ -2043,8 +2527,55 @@ func (m *Migrator) migrateAllSchemaObjects(ctx context.Context, tables []string)
 // migrateAllData migrates all data from MySQL to PostgreSQL
 func (m *Migrator) migrateAllData(ctx context.Context, tables []string) error {
 	for i, table := range tables {
-		fmt.Printf("📦 Migrating data for table %d/%d: %s\n", i+1, len(tables), table)
+		m.logf("📦 Migrating data for table %d/%d: %s\n", i+1, len(tables), table)
+		if err := m.migrateOneTable(ctx, table); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
+// migrateAllDataParallel copies tables through a bounded worker pool. Each
+// worker owns one aligned snapshot connection for its source reads; the first
+// table failure cancels the remaining work.
+func (m *Migrator) migrateAllDataParallel(ctx context.Context, tables []string, snapshots *sourceSnapshots) error {
+	group, groupCtx := errgroup.WithContext(ctx)
+	tableCh := make(chan string)
+
+	for _, conn := range snapshots.conns {
+		workerCtx := withSourceQueryer(groupCtx, conn)
+		group.Go(func() error {
+			for table := range tableCh {
+				m.logf("📦 Migrating data for table: %s\n", table)
+				if err := m.migrateOneTable(workerCtx, table); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+
+	group.Go(func() error {
+		defer close(tableCh)
+		for _, table := range tables {
+			select {
+			case tableCh <- table:
+			case <-groupCtx.Done():
+				return groupCtx.Err()
+			}
+		}
+		return nil
+	})
+
+	return group.Wait()
+}
+
+// migrateOneTable drives one table through state checks, data copy, and
+// completion verification. Safe to call from concurrent workers as long as
+// each worker's context carries its own source queryer.
+func (m *Migrator) migrateOneTable(ctx context.Context, table string) error {
+	tableStart := time.Now()
+	{
 		// Check migration state
 		state, err := m.storage.GetMigration(ctx, m.sessionId, table)
 		if err != nil {
@@ -2057,12 +2588,15 @@ func (m *Migrator) migrateAllData(ctx context.Context, tables []string) error {
 				TableName:    table,
 				Status:       "pending",
 				LastOffset:   0,
+				BatchSize:    int64(m.batchSize),
 				ErrorMessage: "",
 			}
 			if err := m.storage.UpsertMigration(ctx, *state); err != nil {
 				return fmt.Errorf("create migration state for %s: %w", table, err)
 			}
 		}
+
+		startOffset := state.LastOffset
 
 		if state.Status == "done" {
 			targetRows, err := m.targetTableRowCount(ctx, table)
@@ -2075,8 +2609,8 @@ func (m *Migrator) migrateAllData(ctx context.Context, tables []string) error {
 			if err := m.syncIdentitySequences(ctx, table); err != nil {
 				return fmt.Errorf("synchronize identity sequences for completed table %s: %w", table, err)
 			}
-			fmt.Printf("⏭️  Skipping %s (already done)\n", table)
-			continue
+			m.logf("⏭️  Skipping %s (already done)\n", table)
+			return nil
 		}
 
 		if state.Status == "in_progress" || state.Status == "error" {
@@ -2093,7 +2627,7 @@ func (m *Migrator) migrateAllData(ctx context.Context, tables []string) error {
 					return fmt.Errorf("table %s has no primary key and its previous attempt left %d target rows; truncate the target table and start a fresh session", table, targetRows)
 				}
 			}
-			fmt.Printf("🔄 Resuming %s from its last successful checkpoint\n", table)
+			m.logf("🔄 Resuming %s from its last successful checkpoint\n", table)
 		}
 
 		// Update status to in_progress
@@ -2105,8 +2639,18 @@ func (m *Migrator) migrateAllData(ctx context.Context, tables []string) error {
 
 		// Migrate table data
 		if err := m.MigrateTable(ctx, table, m.batchSize); err != nil {
-			fmt.Printf("❌ Migration failed for %s: %v\n", table, err)
-			latest, stateErr := m.storage.GetMigration(ctx, m.sessionId, table)
+			// A user interrupt is not a failure: the last committed batch is
+			// checkpointed and the table stays resumable. Cleanup writes use
+			// a non-cancelled context so the interrupt itself cannot prevent
+			// recording state.
+			cleanupCtx := context.WithoutCancel(ctx)
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				m.warnf("⏸️  Interrupted while migrating %s; progress up to the last committed batch is checkpointed\n", table)
+				return err
+			}
+
+			m.warnf("❌ Migration failed for %s: %v\n", table, err)
+			latest, stateErr := m.storage.GetMigration(cleanupCtx, m.sessionId, table)
 			if stateErr != nil {
 				return fmt.Errorf("migration failed for %s: %w; also failed to read checkpoint: %w", table, err, stateErr)
 			}
@@ -2115,7 +2659,7 @@ func (m *Migrator) migrateAllData(ctx context.Context, tables []string) error {
 			}
 			latest.Status = "error"
 			latest.ErrorMessage = err.Error()
-			if stateErr := m.storage.UpsertMigration(ctx, *latest); stateErr != nil {
+			if stateErr := m.storage.UpsertMigration(cleanupCtx, *latest); stateErr != nil {
 				return fmt.Errorf("migration failed for %s: %w; also failed to save error state: %w", table, err, stateErr)
 			}
 			return err
@@ -2142,9 +2686,69 @@ func (m *Migrator) migrateAllData(ctx context.Context, tables []string) error {
 			return fmt.Errorf("mark migration done for %s: %w", table, err)
 		}
 
-		fmt.Printf("✅ Completed data migration for: %s\n", table)
+		tableRows := latest.LastOffset - startOffset
+		tableTook := time.Since(tableStart)
+		rate := ""
+		if seconds := tableTook.Seconds(); seconds > 0 && tableRows > 0 {
+			rate = fmt.Sprintf(", %.0f rows/s", float64(tableRows)/seconds)
+		}
+		m.logf("✅ Completed data migration for: %s (%d rows in %s%s)\n", table, tableRows, formatDuration(tableTook), rate)
 	}
 
+	return nil
+}
+
+// reportGeneratedColumns emits manual-work DDL for MySQL generated columns.
+// The migrated column is a plain column holding the computed snapshot
+// values; restoring auto-computation requires translating the MySQL
+// expression, so the template deliberately fails to parse until edited.
+func (m *Migrator) reportGeneratedColumns(ctx context.Context, table string) error {
+	columns, err := m.getMySQLTableStructure(ctx, table)
+	if err != nil {
+		return err
+	}
+	for _, col := range columns {
+		if !isGeneratedColumn(col.Extra) {
+			continue
+		}
+		pgType, err := m.convertMySQLTypeToPostgres(col.Type, col.Name, table)
+		if err != nil {
+			pgType = "/* TODO: choose type */"
+		}
+		if col.IsUUID {
+			pgType = "UUID"
+		}
+
+		storage := "STORED"
+		if strings.Contains(strings.ToLower(col.Extra), "virtual") {
+			storage = "VIRTUAL"
+		}
+		m.warnf("⚠️  Column %s.%s is a MySQL %s generated column; it was migrated as a plain column holding the computed snapshot values. Translate its expression manually to restore auto-computation.", table, col.Name, storage)
+
+		quotedSchema := quotePostgresIdentifier(m.schemaName)
+		quotedTable := quotePostgresIdentifier(table)
+		quotedColumn := quotePostgresIdentifier(col.Name)
+		notNull := ""
+		if !col.Nullable {
+			notNull = " NOT NULL"
+		}
+		sql := fmt.Sprintf(`ALTER TABLE %s.%s DROP COLUMN %s;
+ALTER TABLE %s.%s ADD COLUMN %s %s GENERATED ALWAYS AS (/* TODO translate from MySQL: %s */) STORED%s`,
+			quotedSchema, quotedTable, quotedColumn,
+			quotedSchema, quotedTable, quotedColumn, pgType,
+			strings.ReplaceAll(col.GenerationExpression, "*/", "* /"), notNull,
+		)
+		m.schemaMigrator.appendManual(ManualStatement{
+			Kind:  "generated_column",
+			Table: table,
+			Name:  col.Name,
+			SQL:   sql,
+			Reason: fmt.Sprintf(
+				"MySQL computes %s.%s as a %s generated column (%s); the expression cannot be translated automatically. The migrated column holds the snapshot values; edit the expression below, then run to restore auto-computation. PostgreSQL only supports STORED generation.",
+				table, col.Name, storage, col.GenerationExpression,
+			),
+		})
+	}
 	return nil
 }
 

@@ -154,13 +154,41 @@ func TestMySQLTypeMappingHandlesLargeMigrationTypes(t *testing.T) {
 
 func TestBuildCreateTableSQLRejectsGeneratedBehaviorItCannotPreserve(t *testing.T) {
 	migrator := &Migrator{schemaName: "public"}
-	for _, column := range []ColumnInfo{
-		{Name: "updated_at", Type: "timestamp", Extra: "DEFAULT_GENERATED on update CURRENT_TIMESTAMP", HasDefault: true, DefaultValue: "CURRENT_TIMESTAMP"},
-		{Name: "total", Type: "int", Extra: "STORED GENERATED"},
+	// Expression defaults cannot be preserved and still fail closed.
+	if _, err := migrator.buildCreateTableSQL("events", []ColumnInfo{
 		{Name: "token", Type: "varchar(36)", Extra: "DEFAULT_GENERATED", HasDefault: true, DefaultValue: "uuid()"},
-	} {
-		if _, err := migrator.buildCreateTableSQL("events", []ColumnInfo{column}); err == nil {
-			t.Fatalf("expected unsupported behavior for column %#v to fail", column)
+	}); err == nil {
+		t.Fatal("expected expression default to fail")
+	}
+
+	// ON UPDATE CURRENT_TIMESTAMP is accepted: the column migrates normally
+	// and the auto-update behavior becomes trigger DDL in the manual work
+	// file during schema object migration.
+	if _, err := migrator.buildCreateTableSQL("events", []ColumnInfo{
+		{Name: "updated_at", Type: "timestamp", Extra: "DEFAULT_GENERATED on update CURRENT_TIMESTAMP", HasDefault: true, DefaultValue: "CURRENT_TIMESTAMP"},
+	}); err != nil {
+		t.Fatalf("ON UPDATE CURRENT_TIMESTAMP column must build: %v", err)
+	}
+}
+
+func TestBuildColumnDefinitionMigratesGeneratedColumnsAsPlainColumns(t *testing.T) {
+	migrator := &Migrator{schemaName: "public"}
+	for _, extra := range []string{"STORED GENERATED", "VIRTUAL GENERATED"} {
+		def, pgType, err := migrator.buildColumnDefinition("transactions", ColumnInfo{
+			Name:                 "is_international_payout",
+			Type:                 "tinyint(1)",
+			Nullable:             true,
+			Extra:                extra,
+			GenerationExpression: "(`type` = 'INTERNATIONAL')",
+		})
+		if err != nil {
+			t.Fatalf("%s column must build as a plain column: %v", extra, err)
+		}
+		if pgType != "BOOLEAN" {
+			t.Fatalf("unexpected type %q", pgType)
+		}
+		if def != `"is_international_payout" BOOLEAN` {
+			t.Fatalf("generated column must carry no default or identity, got %q", def)
 		}
 	}
 }

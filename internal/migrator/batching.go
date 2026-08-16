@@ -244,29 +244,42 @@ func buildPostgresInsert(schema, table string, columns, conflictColumns []string
 		quotedColumns[i] = quotePostgresIdentifier(column)
 	}
 
-	valueGroups := make([]string, len(rows))
+	// The VALUES clause is assembled into one builder with strconv-formatted
+	// placeholders; per-placeholder fmt.Sprintf plus per-row joins dominated
+	// this function's profile (see hotpath_bench_test.go).
+	var query strings.Builder
+	query.Grow(64 + len(rows)*(len(columns)*6+4))
+	query.WriteString("INSERT INTO ")
+	query.WriteString(quotePostgresIdentifier(schema))
+	query.WriteByte('.')
+	query.WriteString(quotePostgresIdentifier(table))
+	query.WriteString(" (")
+	query.WriteString(strings.Join(quotedColumns, ", "))
+	query.WriteString(") VALUES ")
+
 	args := make([]any, 0, len(rows)*len(columns))
-	parameter := 1
+	parameter := int64(1)
+	numberBuffer := make([]byte, 0, 8)
 	for rowIndex, row := range rows {
 		if len(row) != len(columns) {
 			return "", nil, fmt.Errorf("row %d has %d values for %d columns", rowIndex, len(row), len(columns))
 		}
-		placeholders := make([]string, len(row))
+		if rowIndex > 0 {
+			query.WriteString(", ")
+		}
+		query.WriteByte('(')
 		for columnIndex, value := range row {
-			placeholders[columnIndex] = fmt.Sprintf("$%d", parameter)
+			if columnIndex > 0 {
+				query.WriteString(", ")
+			}
+			query.WriteByte('$')
+			numberBuffer = strconv.AppendInt(numberBuffer[:0], parameter, 10)
+			query.Write(numberBuffer)
 			parameter++
 			args = append(args, value)
 		}
-		valueGroups[rowIndex] = "(" + strings.Join(placeholders, ", ") + ")"
+		query.WriteByte(')')
 	}
-
-	query := fmt.Sprintf(
-		"INSERT INTO %s.%s (%s) VALUES %s",
-		quotePostgresIdentifier(schema),
-		quotePostgresIdentifier(table),
-		strings.Join(quotedColumns, ", "),
-		strings.Join(valueGroups, ", "),
-	)
 
 	if len(conflictColumns) > 0 {
 		quotedConflicts := make([]string, len(conflictColumns))
@@ -290,13 +303,14 @@ func buildPostgresInsert(schema, table string, columns, conflictColumns []string
 			assignments = append(assignments, fmt.Sprintf("%s = EXCLUDED.%s", quotedColumn, quotedColumn))
 		}
 
-		query += fmt.Sprintf(
+		fmt.Fprintf(
+			&query,
 			" ON CONFLICT (%s) DO UPDATE SET %s",
 			strings.Join(quotedConflicts, ", "),
 			strings.Join(assignments, ", "),
 		)
 	}
-	return query, args, nil
+	return query.String(), args, nil
 }
 
 func containsIdentifier(columns []string, target string) bool {
