@@ -25,14 +25,15 @@ import (
 var hintStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#767676"))
 
 type sessionOptions struct {
-	id               string
-	batchSize        int
-	includeTables    []string
-	excludeTables    []string
-	dryRun           bool
-	loadMethod       string
-	workers          int
-	skipSnapshotLock bool
+	id                string
+	batchSize         int
+	includeTables     []string
+	excludeTables     []string
+	dryRun            bool
+	loadMethod        string
+	workers           int
+	skipSnapshotLock  bool
+	sourceCompression bool
 }
 
 func RegisterCliCommand() *cobra.Command {
@@ -85,6 +86,7 @@ func RegisterCliCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.loadMethod, "load-method", string(migrator.LoadMethodCopy), "how batches are written to PostgreSQL: copy or insert")
 	cmd.Flags().IntVar(&opts.workers, "workers", 1, "tables migrated concurrently; workers > 1 aligns per-worker snapshots under a brief FLUSH TABLES WITH READ LOCK")
 	cmd.Flags().BoolVar(&opts.skipSnapshotLock, "skip-snapshot-lock", false, "skip the snapshot alignment lock; only safe when the source receives no writes during the migration")
+	cmd.Flags().BoolVar(&opts.sourceCompression, "source-compression", true, "zlib-compress the MySQL connection; a large win for remote sources, disable with --source-compression=false")
 	cmd.MarkFlagsMutuallyExclusive("include-tables", "exclude-tables")
 
 	return cmd
@@ -196,6 +198,7 @@ func cliSession(ctx context.Context, storage *storage.Storage, sessionCipher enc
 			User:     inputs.MySQL.User,
 			Password: inputs.MySQL.Password,
 			Database: inputs.MySQL.Database,
+			Options:  mysqlOptions(opts.sourceCompression),
 		})
 
 		if err != nil {
@@ -336,6 +339,16 @@ func sessionEventFromEngine(sessionId string, event migrator.Event) storage.Sess
 		TotalRows:     event.TotalRows,
 		CreatedAt:     event.Time,
 	}
+}
+
+// mysqlOptions builds source DSN options. Wire compression trades idle CPU
+// for a large transfer reduction on text-heavy tables, which dominates
+// migration time when the source is remote.
+func mysqlOptions(compression bool) string {
+	if compression {
+		return "compress=true"
+	}
+	return ""
 }
 
 func parseConnectorPort(value string, databaseName string) (int, error) {

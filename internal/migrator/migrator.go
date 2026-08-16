@@ -567,11 +567,18 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 
 	group, groupCtx := errgroup.WithContext(ctx)
 
+	// Wait-time accounting: each duration is owned by one goroutine and read
+	// only after group.Wait, so a completed table can report where its wall
+	// time actually went (source reads vs target writes vs local work).
+	var sourceReadTime, transformTime, targetWriteTime, checkpointTime time.Duration
+	phaseStart := time.Now()
+
 	group.Go(func() error {
 		defer close(batches)
 		readCursor := cursor
 		readOffset := processedRows
 		for {
+			readStart := time.Now()
 			query, queryArgs, err := buildMySQLBatchQuery(table, mysqlColumns, primaryKeyColumns, readCursor, readOffset, batchSize)
 			if err != nil {
 				return fmt.Errorf("build source query for %s: %w", table, err)
@@ -612,9 +619,11 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 				return fmt.Errorf("close source rows for %s: %w", table, err)
 			}
 			if len(values) == 0 {
+				sourceReadTime += time.Since(readStart)
 				return nil
 			}
 
+			sourceReadTime += time.Since(readStart)
 			readCursor, err = extractCursor(values[len(values)-1], mysqlColumns, primaryKeyColumns)
 			if err != nil {
 				return fmt.Errorf("capture resume cursor for %s: %w", table, err)
@@ -638,19 +647,24 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 
 	group.Go(func() error {
 		for batch := range batches {
+			transformStart := time.Now()
 			transformedValues, err := m.validateAndTransformData(groupCtx, table, mappedColumns, batch.values)
 			if err != nil {
 				return fmt.Errorf("validate/transform data for %s: %w", table, err)
 			}
+			transformTime += time.Since(transformStart)
 
 			replayRisk := replayWindow < 0 || loadedThisInvocation < replayWindow
+			writeStart := time.Now()
 			if err := m.loadBatch(groupCtx, table, mappedColumns, mappedPrimaryKeyColumns, transformedValues, replayRisk); err != nil {
 				return err
 			}
+			targetWriteTime += time.Since(writeStart)
 			loadedThisInvocation += int64(len(batch.values))
 			processedRows += int64(len(batch.values))
 			m.rowsCopiedThisRun.Add(int64(len(batch.values)))
 
+			checkpointStart := time.Now()
 			if err := m.storage.UpsertMigration(groupCtx, storage.MigrationRecord{
 				SessionId:    m.sessionId,
 				TableName:    table,
@@ -663,6 +677,7 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 			}); err != nil {
 				return fmt.Errorf("checkpoint migration for %s: %w", table, err)
 			}
+			checkpointTime += time.Since(checkpointStart)
 
 			progress := fmt.Sprintf("%d rows", processedRows)
 			if rowCount > 0 {
@@ -675,6 +690,16 @@ func (m *Migrator) MigrateTable(ctx context.Context, table string, batchSize int
 
 	if err := group.Wait(); err != nil {
 		return err
+	}
+
+	// The reader and writer overlap, so segments are reported against wall
+	// time individually; the dominant segment is the bottleneck.
+	if wall := time.Since(phaseStart); wall > time.Second {
+		m.logf("⏱  %s time breakdown: source read %s (%.0f%%), target write %s (%.0f%%), transform %s, checkpoints %s (wall %s)",
+			table,
+			formatDuration(sourceReadTime), 100*sourceReadTime.Seconds()/wall.Seconds(),
+			formatDuration(targetWriteTime), 100*targetWriteTime.Seconds()/wall.Seconds(),
+			formatDuration(transformTime), formatDuration(checkpointTime), formatDuration(wall))
 	}
 
 	if err := m.syncIdentitySequences(ctx, table); err != nil {

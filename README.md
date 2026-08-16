@@ -46,6 +46,7 @@ Starts a migration. Without `--id` it prompts interactively for the MySQL and Po
 | `--load-method copy\|insert` | `copy` | How batches are written to PostgreSQL |
 | `--workers <n>` | `1` | Tables migrated concurrently (max 16) |
 | `--skip-snapshot-lock` | off | Skip the multi-worker snapshot alignment lock (see below) |
+| `--source-compression` | on | zlib compression on the MySQL connection |
 
 Notes on each:
 
@@ -142,6 +143,8 @@ The guiding rule is fail-closed: stop with an actionable error instead of silent
 Loading data before secondary indexes, foreign keys, and triggers improves throughput and prevents target-side behavior from changing copied rows.
 
 ## Operational notes
+
+Migration speed is usually bound by the network, not by pgstream: a CLI at 1–5% CPU is waiting on the databases. Each completed table logs a time breakdown (`⏱ source read … target write …`) that shows which side dominates. The two biggest levers: run pgstream close to the databases (for cloud sources, a small instance in the same region routinely beats a fast machine over a WAN by an order of magnitude), and keep `--source-compression` on — MySQL wire compression shrinks text-heavy transfers several-fold for idle CPU you already have.
 
 Each invocation reads rows from one consistent source snapshot. For an interrupted migration resumed in a later process, keep the source quiescent until cutover: a new invocation necessarily opens a new snapshot and cannot account for changes made between snapshots without CDC/binlog tailing.
 

@@ -69,25 +69,30 @@ type sessionRequest struct {
 	LoadMethod       string            `json:"load_method,omitempty"`
 	Workers          int               `json:"workers,omitempty"`
 	SkipSnapshotLock bool              `json:"skip_snapshot_lock,omitempty"`
+	// DisableSourceCompression opts out of MySQL wire compression (on by
+	// default; the zero value keeps it enabled).
+	DisableSourceCompression bool `json:"disable_source_compression,omitempty"`
 }
 
 type resumeRequest struct {
-	BatchSize        int      `json:"batch_size,omitempty"`
-	IncludeTables    []string `json:"include_tables,omitempty"`
-	ExcludeTables    []string `json:"exclude_tables,omitempty"`
-	LoadMethod       string   `json:"load_method,omitempty"`
-	Workers          int      `json:"workers,omitempty"`
-	SkipSnapshotLock bool     `json:"skip_snapshot_lock,omitempty"`
+	BatchSize                int      `json:"batch_size,omitempty"`
+	IncludeTables            []string `json:"include_tables,omitempty"`
+	ExcludeTables            []string `json:"exclude_tables,omitempty"`
+	LoadMethod               string   `json:"load_method,omitempty"`
+	Workers                  int      `json:"workers,omitempty"`
+	SkipSnapshotLock         bool     `json:"skip_snapshot_lock,omitempty"`
+	DisableSourceCompression bool     `json:"disable_source_compression,omitempty"`
 }
 
 type runOptions struct {
-	batchSize        int
-	includeTables    []string
-	excludeTables    []string
-	loadMethod       string
-	workers          int
-	skipSnapshotLock bool
-	fresh            bool
+	batchSize                int
+	includeTables            []string
+	excludeTables            []string
+	loadMethod               string
+	workers                  int
+	skipSnapshotLock         bool
+	disableSourceCompression bool
+	fresh                    bool
 }
 
 func (r *sessionRequest) validate() error {
@@ -292,13 +297,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	options := runOptions{
-		batchSize:        request.BatchSize,
-		includeTables:    request.IncludeTables,
-		excludeTables:    request.ExcludeTables,
-		loadMethod:       request.LoadMethod,
-		workers:          request.Workers,
-		skipSnapshotLock: request.SkipSnapshotLock,
-		fresh:            true,
+		batchSize:                request.BatchSize,
+		includeTables:            request.IncludeTables,
+		excludeTables:            request.ExcludeTables,
+		loadMethod:               request.LoadMethod,
+		workers:                  request.Workers,
+		skipSnapshotLock:         request.SkipSnapshotLock,
+		disableSourceCompression: request.DisableSourceCompression,
+		fresh:                    true,
 	}
 	if err := s.startRun(sessionID, inputs, options); err != nil {
 		writeError(w, http.StatusConflict, err)
@@ -330,13 +336,14 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	options := runOptions{
-		batchSize:        request.BatchSize,
-		includeTables:    request.IncludeTables,
-		excludeTables:    request.ExcludeTables,
-		loadMethod:       request.LoadMethod,
-		workers:          request.Workers,
-		skipSnapshotLock: request.SkipSnapshotLock,
-		fresh:            false,
+		batchSize:                request.BatchSize,
+		includeTables:            request.IncludeTables,
+		excludeTables:            request.ExcludeTables,
+		loadMethod:               request.LoadMethod,
+		workers:                  request.Workers,
+		skipSnapshotLock:         request.SkipSnapshotLock,
+		disableSourceCompression: request.DisableSourceCompression,
+		fresh:                    false,
 	}
 	if err := s.startRun(sessionID, inputs, options); err != nil {
 		writeError(w, http.StatusConflict, err)
@@ -446,6 +453,10 @@ func (s *Server) executeMigration(ctx context.Context, sessionID string, inputs 
 	}
 
 	sink(migrator.Event{Time: time.Now(), Level: migrator.EventInfo, Message: fmt.Sprintf("🔌 Connecting to MySQL %s@%s:%d/%s...", inputs.MySQL.User, inputs.MySQL.Host, mysqlPort, inputs.MySQL.Database)})
+	sourceOptions := "compress=true"
+	if options.disableSourceCompression {
+		sourceOptions = ""
+	}
 	mysqlConnector, err := database.Connect(ctx, config.Database{
 		Driver:   config.DatabaseDriverMySQL,
 		Host:     inputs.MySQL.Host,
@@ -453,6 +464,7 @@ func (s *Server) executeMigration(ctx context.Context, sessionID string, inputs 
 		User:     inputs.MySQL.User,
 		Password: inputs.MySQL.Password,
 		Database: inputs.MySQL.Database,
+		Options:  sourceOptions,
 	})
 	if err != nil {
 		return fmt.Errorf("connect to MySQL: %w", err)
@@ -509,6 +521,10 @@ func (s *Server) handleDryRun(w http.ResponseWriter, r *http.Request) {
 	}
 	inputs := request.migratorConfig()
 
+	dryRunSourceOptions := "compress=true"
+	if request.DisableSourceCompression {
+		dryRunSourceOptions = ""
+	}
 	mysqlConnector, err := database.Connect(r.Context(), config.Database{
 		Driver:   config.DatabaseDriverMySQL,
 		Host:     inputs.MySQL.Host,
@@ -516,6 +532,7 @@ func (s *Server) handleDryRun(w http.ResponseWriter, r *http.Request) {
 		User:     inputs.MySQL.User,
 		Password: inputs.MySQL.Password,
 		Database: inputs.MySQL.Database,
+		Options:  dryRunSourceOptions,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, fmt.Errorf("connect to MySQL: %w", err))
