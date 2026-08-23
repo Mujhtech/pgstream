@@ -17,7 +17,7 @@ require (
 	github.com/rs/zerolog v1.35.1
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sync v0.22.0
-	modernc.org/sqlite v1.56.0
+	modernc.org/sqlite v1.57.0
 )
 
 require (
